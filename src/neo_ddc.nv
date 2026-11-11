@@ -27,7 +27,6 @@ use embedded_hal.{ I2cBus }
 use dev_bus.{ DeviceWiring, DevBytes }
 use neo
 use neo.{ NeoCore }
-use ubx
 
 // The default I2C address of the receiver.
 pub const DDC_ADDR = 0x42
