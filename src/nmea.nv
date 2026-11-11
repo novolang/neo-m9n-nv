@@ -1,0 +1,295 @@
+// nmea — a small NMEA 0183 reader for the sentences GGA and RMC, as the
+// fallback when a receiver has its UBX output off or has not been told to
+// switch it on.
+//
+// The facts below are from the NMEA sections of the u-blox 8 / M8 receiver
+// description, UBX-13003221 R15 (Section 31), and from the M9 interface
+// description UBX-21022436 R02 (Section 2).  A sentence is
+//
+//   $ talker(2) type(3) , field , field ... * hh CR LF
+//
+// where `hh` is the exclusive-or of every character between `$` and `*`, in
+// two hexadecimal digits.  GGA (fix data) gives the time, the position, the
+// fix quality, the number of satellites used and the altitude above mean sea
+// level; RMC (recommended minimum data) gives the time, the status, the
+// position, the speed over ground in knots, the course over ground and the
+// date.
+//
+// Fix kept: a sentence whose checksum is wrong is dropped.  The `ublox` crate
+// and Zephyr's `gnss_nmea0183` both check it; a line cut by a byte lost on the
+// UART otherwise yields a position with a wrong digit.
+//
+// Fix kept: a fix is complete when a GGA and an RMC with the same time have
+// both been read, because neither carries the whole GnssFix (the date and
+// speed are in RMC only, the altitude and the satellite count in GGA only).
+// A receiver emits them in either order, and this reader does not assume one.
+//
+// Fix kept: the position of a GGA with quality 0, and of an RMC with status V,
+// is not a position.  The reader answers no fix there, with the fields it
+// read, which are empty.
+//
+// Fix kept: the talker is ignored (GP, GN, GL, GA, GB), since a receiver that
+// uses several constellations says GN.
+
+use dev_gnss.{ GnssFix, FixKind }
+use dev_rtc.{ RtcDateTime }
+
+// The longest sentence the reader keeps, in characters between `$` and the
+// end of the line; NMEA 0183 limits a sentence to 82 characters with the
+// `$` and the line end.
+pub const LINE_MAX = 100
+
+// What `push` answers: the byte completed nothing; a GGA or RMC with a good
+// checksum was read; a sentence of another type with a good checksum; a
+// sentence with a bad checksum.
+pub const NMEA_NONE = 0
+// A GGA or an RMC with a good checksum was read.
+pub const NMEA_USED = 1
+// A sentence of another type with a good checksum was read.
+pub const NMEA_OTHER = 2
+// A sentence with a bad checksum was dropped.
+pub const NMEA_BAD = 3
+
+// A reader of NMEA text: the sentence being collected and the fields of the
+// last GGA and RMC.
+pub @value
+struct NmeaReader
+    active: Bool
+    line: Vec[u8; 100]
+    gga_key: Int
+    rmc_key: Int
+    hour: Int
+    minute: Int
+    second: Int
+    millis: Int
+    lat: Int
+    lon: Int
+    alt: Int
+    alt_known: Bool
+    quality: Int
+    sats: Int
+    status_ok: Bool
+    speed: Int
+    course: Int
+    day: Int
+    month: Int
+    year: Int
+    fresh: Bool
+
+// A reader that has read nothing.
+pub fn reader_new() -> NmeaReader
+    NmeaReader { active: false, line: Vec.new(), gga_key: -1, rmc_key: -2, hour: 0, minute: 0, second: 0, millis: 0,
+                 lat: 0, lon: 0, alt: 0, alt_known: false, quality: 0, sats: 0, status_ok: false, speed: 0,
+                 course: 0, day: 0, month: 0, year: 0, fresh: false }
+
+// The value of a hexadecimal digit, or -1.
+pub fn hex_of(ch: Int) -> Int
+    if ch >= 48 and ch <= 57
+        return ch - 48
+    if ch >= 65 and ch <= 70
+        return ch - 55
+    if ch >= 97 and ch <= 102
+        return ch - 87
+    -1
+
+// The index of the first character of field `n`, 1 or more, of the sentence
+// in the reader (field 0 is the type), or -1 when the sentence has fewer
+// fields.
+fn field_start(var rd: NmeaReader, n: Int) -> Int
+    var seen = 0
+    for i in 0..rd.line.len()
+        if (rd.line[i] as Int) == 44
+            seen = seen + 1
+            if seen == n
+                return i + 1
+    -1
+
+// The index just past field `n`'s last character: the next comma, the star,
+// or the end of the sentence.
+fn field_end(var rd: NmeaReader, from: Int) -> Int
+    for i in from..rd.line.len()
+        let ch = rd.line[i] as Int
+        if ch == 44 or ch == 42
+            return i
+    // cov: skip — a sentence that passed the checksum has its star three characters from the end, so the loop returns there
+    rd.line.len()
+
+// The number in field `n` with `decimals` decimal places, as an integer
+// scaled by 10 to that power, extra digits truncated; -1 for an empty or
+// missing field.  "4807.038" with 3 decimals is 4807038.
+fn field_number(var rd: NmeaReader, n: Int, decimals: Int) -> Int
+    let from = field_start(var rd, n)
+    if from < 0
+        return -1
+    let to = field_end(var rd, from)
+    if to == from
+        return -1
+    var whole = 0
+    var frac = 0
+    var frac_digits = 0
+    var in_frac = false
+    for i in from..to
+        let ch = rd.line[i] as Int
+        if ch == 46
+            in_frac = true
+        elif ch >= 48 and ch <= 57
+            if in_frac
+                if frac_digits < decimals
+                    frac = frac * 10 + ch - 48
+                    frac_digits = frac_digits + 1
+            else
+                whole = whole * 10 + ch - 48
+    for _k in frac_digits..decimals
+        frac = frac * 10
+    var scale = 1
+    for _k in 0..decimals
+        scale = scale * 10
+    whole * scale + frac
+
+// The first character of field `n`, or 0 for an empty or missing field.
+fn field_char(var rd: NmeaReader, n: Int) -> Int
+    let from = field_start(var rd, n)
+    if from < 0 or from >= rd.line.len()
+        return 0
+    let ch = rd.line[from] as Int
+    if ch == 44 or ch == 42
+        return 0
+    ch
+
+// A coordinate field "ddmm.mmmm" or "dddmm.mmmm" and the hemisphere field
+// after it, in 1e-7 degrees, negative for S and W; 0 when empty.
+fn coordinate(var rd: NmeaReader, n: Int) -> Int
+    let raw = field_number(var rd, n, 6)
+    if raw < 0
+        return 0
+    // The number is ddmm.mmmmmm scaled by 1e6 (or dddmm.mmmmmm): the minutes
+    // are the part below 100 * 1e6 and the degrees what is above.
+    let deg = raw / (100 * 1000000)
+    let minutes_e6 = raw % (100 * 1000000)
+    let neg = field_char(var rd, n + 1)
+    dev_gnss.gnss_of_nmea(deg, minutes_e6, neg == 83 or neg == 87)
+
+// Reads the time field `n` "hhmmss.ss" into the reader and answers its key,
+// the time in hundredths of a second since midnight, or -1 for an empty
+// field.
+fn read_time(var rd: NmeaReader, n: Int) -> Int
+    let t = field_number(var rd, n, 2)
+    if t < 0
+        return -1
+    rd.hour = t / 1000000
+    rd.minute = t / 10000 % 100
+    rd.second = t / 100 % 100
+    rd.millis = t % 100 * 10
+    t
+
+// Reads a GGA into the reader.
+fn read_gga(var rd: NmeaReader)
+    rd.gga_key = read_time(var rd, 1)
+    rd.lat = coordinate(var rd, 2)
+    rd.lon = coordinate(var rd, 4)
+    rd.quality = 0
+    let q = field_number(var rd, 6, 0)
+    if q > 0
+        rd.quality = q
+    rd.sats = 0
+    let s = field_number(var rd, 7, 0)
+    if s > 0
+        rd.sats = s
+    let a = field_number(var rd, 9, 3)
+    rd.alt_known = a >= 0
+    rd.alt = 0
+    if a >= 0
+        rd.alt = a
+        if field_char(var rd, 9) == 45
+            rd.alt = 0 - a
+
+// Reads an RMC into the reader.
+fn read_rmc(var rd: NmeaReader)
+    rd.rmc_key = read_time(var rd, 1)
+    rd.status_ok = field_char(var rd, 2) == 65
+    let sp = field_number(var rd, 7, 3)
+    rd.speed = 0
+    if sp > 0
+        // Knots times 1852 m / 3600 s, in millimetres a second.
+        rd.speed = sp * 1852 / 3600
+    let co = field_number(var rd, 8, 3)
+    rd.course = 0
+    if co > 0
+        rd.course = co % 360000
+    let d = field_number(var rd, 9, 0)
+    if d >= 0
+        rd.day = d / 10000
+        rd.month = d / 100 % 100
+        rd.year = 2000 + d % 100
+
+// Whether the sentence's type is `a b c` (the three letters after the
+// talker).
+fn is_type(var rd: NmeaReader, a: Int, b: Int, c: Int) -> Bool
+    rd.line.len() >= 5 and (rd.line[2] as Int) == a and (rd.line[3] as Int) == b and (rd.line[4] as Int) == c
+
+// Whether the collected sentence's checksum is right: the exclusive-or of
+// the characters before the star equals the two hexadecimal digits after.
+fn checksum_ok(var rd: NmeaReader) -> Bool
+    let n = rd.line.len()
+    if n < 3 or (rd.line[n - 3] as Int) != 42
+        return false
+    var x = 0
+    for i in 0..n - 3
+        x = x ^ rd.line[i] as Int
+    let hi = hex_of(rd.line[n - 2] as Int)
+    let lo = hex_of(rd.line[n - 1] as Int)
+    hi >= 0 and lo >= 0 and x == hi * 16 + lo
+
+// Gives the reader one byte.  A `$` starts a sentence; the line end ends it.
+// The sentence is dropped if it is longer than `LINE_MAX` or its checksum is
+// wrong.  A GGA or an RMC updates the reader; when both have been read for
+// one time, `fresh` is set.  Answers what the byte completed.
+pub fn push(var rd: NmeaReader, b: Int) -> Int
+    if b == 36
+        rd.line.clear()
+        rd.active = true
+        return NMEA_NONE
+    if not rd.active
+        return NMEA_NONE
+    if b != 10 and b != 13
+        if rd.line.len() < LINE_MAX
+            let _ = rd.line.push(b as u8)
+        else
+            rd.active = false
+        return NMEA_NONE
+    rd.active = false
+    if rd.line.len() == 0
+        return NMEA_NONE
+    if not checksum_ok(var rd)
+        return NMEA_BAD
+    if is_type(var rd, 71, 71, 65)
+        read_gga(var rd)
+    elif is_type(var rd, 82, 77, 67)
+        read_rmc(var rd)
+    else
+        return NMEA_OTHER
+    if rd.gga_key >= 0 and rd.gga_key == rd.rmc_key
+        rd.fresh = true
+    NMEA_USED
+
+// The kind of solution the two sentences say: none for quality 0 or status V,
+// dead reckoning for quality 6, 3D when the altitude is known and 2D when not.
+pub fn kind_of(quality: Int, status_ok: Bool, alt_known: Bool) -> FixKind
+    if quality == 0 or not status_ok
+        return FixNone
+    if quality == 6
+        return FixDeadReckoning
+    if alt_known
+        return Fix3d
+    Fix2d
+
+// The fix the reader holds.  The satellites in view are those used.
+pub fn fix_of(rd: NmeaReader) -> GnssFix
+    let kind = kind_of(rd.quality, rd.status_ok, rd.alt_known)
+    let t = RtcDateTime { year: rd.year, month: rd.month, day: rd.day, hour: rd.hour, minute: rd.minute,
+                          second: rd.second }
+    if kind == FixNone
+        return GnssFix { time: t, millis: rd.millis, kind: kind, lat_e7: 0, lon_e7: 0, alt_mm: 0, speed_mm_s: 0,
+                         course_mdeg: 0, sats_used: rd.sats, sats_in_view: rd.sats }
+    GnssFix { time: t, millis: rd.millis, kind: kind, lat_e7: rd.lat, lon_e7: rd.lon, alt_mm: rd.alt,
+              speed_mm_s: rd.speed, course_mdeg: rd.course, sats_used: rd.sats, sats_in_view: rd.sats }

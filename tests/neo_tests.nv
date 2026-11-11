@@ -1,0 +1,1188 @@
+// neo_tests — the driver over doubles of the receiver's line: the UBX frames
+// of the u-blox documents (UBX-21022436 R02 for the M9, UBX-13003221 R15 for
+// the M8), a UBX-NAV-PVT frame derived by hand, NMEA sentences with their
+// checksums, and a port that plays back the frames the receiver would answer
+// with, one for each frame the driver sends, and records the bytes the driver
+// sends.
+//
+// The UBX-NAV-PVT frame of the suite is built from these values, each placed at
+// the byte offset Section 3.15.11 gives and written little-endian:
+//
+//   iTOW 1000000 ms = 0x000F4240 at 0       year 2026 = 0x07EA at 4
+//   month 11, day 11, hour 12, min 34 (0x22), sec 56 (0x38) at 6 to 10
+//   valid 0x07 (date, time, fully resolved) at 11
+//   tAcc 50 ns at 12                         nano 123000000 = 0x0754D4C0 at 16
+//   fixType 3 at 20, flags 0x01 (gnssFixOK) at 21, numSV 12 at 23
+//   lon 115760000 = 0x06E65B80 at 24         lat 481373000 = 0x1CB12B48 at 28
+//   height 560000 mm at 32, hMSL 515000 mm = 0x0007DBB8 at 36
+//   hAcc 1500 at 40, vAcc 2300 at 44         velN 1000 at 48, velE -500 (0xFFFFFE0C) at 52
+//   gSpeed 1118 = 0x0000045E at 60           headMot 33343500 = 0x01FCC80C at 64
+//   sAcc 200 at 68, headAcc 500000 at 72     pDOP 150 (1.50) at 76
+//
+// The checksum of the whole frame is CK_A 0x7F, CK_B 0xF9, which the suite
+// computes itself and compares with those two bytes.  The fix it means is
+// 2026-11-11 12:34:56.123 UTC, 48.1373 N, 11.5760 E, 515 m above mean sea
+// level, 1118 mm/s on a course of 333.435 degrees (33343500 / 100), 12
+// satellites.  The checksum of the acknowledge of a UBX-CFG-MSG is the
+// documents' own example: 05 + 01 + 02 + 00 + 06 + 01 = 0x0F for CK_A, and
+// the running sums 05, 06, 08, 08, 0E, 0F add to 0x38 for CK_B.
+//
+// The NMEA sentences: 4807.038 N is 48 degrees and 7.038 minutes, which is
+// 48 + 7.038 / 60 = 48.1173 degrees, 481173000 in 1e-7 degrees; 01131.000 E
+// is 11 degrees and 31 minutes, 11 + 31 / 60 = 11.5166667, 115166666 after
+// truncation; 22.4 knots is 22.4 * 1852 / 3600 = 11523.6 mm/s, 11523 truncated.
+
+use std.test
+use embedded_hal.{ BoardUart, I2cBus, UartRxAsync }
+use dev_bus
+use dev_bus.{ DeviceWiring }
+use dev_gnss.{ GnssFix, Gnss, GnssAsync, FixKind }
+use dev_rtc.{ RtcDateTime }
+use dev_id.{ DeviceId, Identifiable }
+use ubx
+use ubx.{ UbxReader, UbxPvt }
+use nmea
+use nmea.{ NmeaReader }
+use neo
+use neo.{ Neo, NeoCore, NeoPort }
+use neo_ddc
+use neo_async.{ NeoAsync }
+
+// ── Frames ───────────────────────────────────────────────────────────
+
+// The first 80 bytes of the UBX-NAV-PVT payload described above; the
+// reserved bytes after them are zero.
+fn pvt_head() -> [Int]
+    [0x40, 0x42, 0x0F, 0x00, 0xEA, 0x07, 0x0B, 0x0B, 0x0C, 0x22, 0x38, 0x07, 0x32, 0x00, 0x00, 0x00,
+     0xC0, 0xD4, 0x54, 0x07, 0x03, 0x01, 0x00, 0x0C, 0x80, 0x5B, 0xE6, 0x06, 0x48, 0x2B, 0xB1, 0x1C,
+     0x80, 0x8B, 0x08, 0x00, 0xB8, 0xDB, 0x07, 0x00, 0xDC, 0x05, 0x00, 0x00, 0xFC, 0x08, 0x00, 0x00,
+     0xE8, 0x03, 0x00, 0x00, 0x0C, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x5E, 0x04, 0x00, 0x00,
+     0x0C, 0xC8, 0xFC, 0x01, 0xC8, 0x00, 0x00, 0x00, 0x20, 0xA1, 0x07, 0x00, 0x96, 0x00, 0x00, 0x00]
+
+fn pvt_payload() -> [Int]
+    var xs = pvt_head()
+    for _i in 0..12
+        list.push(xs, 0)
+    xs
+
+// Writes the `n`-byte little-endian `v` at `off`.
+fn put_le(var xs: [Int], off: Int, n: Int, v: Int)
+    for i in 0..n
+        xs[off + i] = (v >> (8 * i)) & 0xFF
+
+// A frame of the class `cls`, the identifier `id` and the payload, with the
+// Fletcher checksum the documents give (Section 3.4).
+fn frame_of(cls: Int, id: Int, payload: [Int]) -> [Int]
+    var f: [Int] = [0xB5, 0x62, cls, id, payload.len() & 0xFF, (payload.len() >> 8) & 0xFF]
+    for b in payload
+        list.push(f, b)
+    var a = 0
+    var k = 0
+    for i in 2..f.len()
+        a = (a + f[i]) & 0xFF
+        k = (k + a) & 0xFF
+    list.push(f, a)
+    list.push(f, k)
+    f
+
+fn pvt_frame() -> [Int]
+    frame_of(1, 7, pvt_payload())
+
+fn ack_frame(ok: Bool, cls: Int, id: Int) -> [Int]
+    var i = 0
+    if ok
+        i = 1
+    frame_of(5, i, [cls, id])
+
+fn text_bytes(s: Str) -> [Int]
+    var xs: [Int] = []
+    for i in 0..str.len(s)
+        list.push(xs, str.byte_at_or(s, i, 0))
+    xs
+
+fn put_text(var xs: [Int], at: Int, s: Str)
+    for i in 0..str.len(s)
+        xs[at + i] = str.byte_at_or(s, i, 0)
+
+// A UBX-MON-VER payload: 30 bytes of software version, 10 of hardware version
+// and three extension strings of 30, the second of which names the protocol
+// version.
+fn ver_payload(protver: Str) -> [Int]
+    var xs: [Int] = []
+    for _i in 0..130
+        list.push(xs, 0)
+    put_text(var xs, 0, "EXT CORE 4.04 (7f89f7)")
+    put_text(var xs, 30, "00190000")
+    put_text(var xs, 40, "FWVER=SPG 4.04")
+    put_text(var xs, 70, protver)
+    put_text(var xs, 100, "MOD=NEO-M9N-00B")
+    xs
+
+fn ver_frame(protver: Str) -> [Int]
+    frame_of(0x0A, 0x04, ver_payload(protver))
+
+// An NMEA sentence with its checksum and line end.
+fn sentence(body: Str) -> [Int]
+    var x = 0
+    for i in 0..str.len(body)
+        x = x ^ str.byte_at_or(body, i, 0)
+    let hex = "0123456789ABCDEF"
+    var xs: [Int] = [36]
+    for b in text_bytes(body)
+        list.push(xs, b)
+    list.push(xs, 42)
+    list.push(xs, str.byte_at_or(hex, x / 16, 48))
+    list.push(xs, str.byte_at_or(hex, x % 16, 48))
+    list.push(xs, 13)
+    list.push(xs, 10)
+    xs
+
+fn gga() -> [Int]
+    sentence("GNGGA,123456.00,4807.038,N,01131.000,E,1,12,0.9,545.4,M,46.9,M,,")
+
+fn rmc() -> [Int]
+    sentence("GNRMC,123456.00,A,4807.038,N,01131.000,E,022.4,084.4,111126,003.1,W,A,V")
+
+fn push_all(var r: UbxReader, xs: [Int]) -> Int
+    var last = ubx.PUSH_NONE
+    for b in xs
+        let v = ubx.push(var r, b)
+        if v != ubx.PUSH_NONE
+            last = v
+    last
+
+fn feed_all(var c: NeoCore, xs: [Int])
+    for b in xs
+        neo.feed(var c, b)
+
+fn fix_or(o: ?GnssFix) -> GnssFix
+    match o
+        Some(f) => f
+        None    => neo.no_fix()
+
+fn is_none(o: ?GnssFix) -> Bool
+    match o
+        Some(_f) => false
+        None     => true
+
+// ── The checksum and the builders ────────────────────────────────────
+
+@test
+fn test_the_checksum_is_the_8_bit_fletcher_of_the_documents() [io, hw]
+    // The acknowledge of a UBX-CFG-MSG: CK_A 0x0F, CK_B 0x38.
+    let f = ack_frame(true, 0x06, 0x01)
+    test.assert_eq(f.len(), 10)
+    test.assert_eq(f[8], 0x0F)
+    test.assert_eq(f[9], 0x38)
+    // The poll of UBX-MON-VER: 0A + 04 + 00 + 00 = 0x0E, and 0A, 0E, 0E, 0E
+    // add to 0x34.
+    let p = frame_of(0x0A, 0x04, [])
+    test.assert_eq(p[6], 0x0E)
+    test.assert_eq(p[7], 0x34)
+    // The navigation frame.
+    let n = pvt_frame()
+    test.assert_eq(n.len(), 100)
+    test.assert_eq(n[98], 0x7F)
+    test.assert_eq(n[99], 0xF9)
+
+@test
+fn test_the_builders_make_the_documents_frames() [io, hw]
+    var f: Vec[u8; 40] = Vec.new()
+    ubx.build_poll(var f, 0x0A, 0x04)
+    test.assert_eq(f.len(), 8)
+    test.assert_eq(f[6] as Int, 0x0E)
+    test.assert_eq(f[7] as Int, 0x34)
+    // UBX-CFG-MSG for NAV-PVT at rate 1 on the current port (the M8).
+    ubx.build_cfg_msg(var f, 0x01, 0x07, 1)
+    test.assert_eq(bytes_of(f), [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0x01, 0x07, 0x01, 0x13, 0x51])
+    // UBX-CFG-RATE: 1000 ms, one solution a measurement, GPS time.
+    ubx.build_cfg_rate(var f, 1000, 1, 1)
+    test.assert_eq(bytes_of(f),
+        [0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0xE8, 0x03, 0x01, 0x00, 0x01, 0x00, 0x01, 0x39])
+    // UBX-CFG-PRT for UART 1: portID 1, mode 0x8C0, 38400 baud, UBX in and out.
+    ubx.build_cfg_prt_uart1(var f, 38400, 1, 1)
+    test.assert_eq(bytes_of(f), [0xB5, 0x62, 0x06, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0xC0, 0x08, 0x00, 0x00,
+        0x00, 0x96, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7B, 0x54])
+    // UBX-CFG-VALSET to the RAM layer: version 0, layers 1, two reserved
+    // bytes, the key and the value.
+    test.assert(ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_UART1OUT_UBX, 1))
+    test.assert_eq(bytes_of(f), [0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x74, 0x10,
+        0x01, 0x20, 0xB3])
+    test.assert(ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_RATE_MEAS, 1000))
+    test.assert_eq(bytes_of(f), [0xB5, 0x62, 0x06, 0x8A, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x21, 0x30,
+        0xE8, 0x03, 0xD8, 0xC4])
+    test.assert(ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_UART1_BAUD, 115200))
+    test.assert_eq(bytes_of(f), [0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40,
+        0x00, 0xC2, 0x01, 0x00, 0xF3, 0xA5])
+    // UBX-CFG-VALGET from the RAM layer, position 0.
+    ubx.build_valget(var f, 0, ubx.KEY_RATE_MEAS)
+    test.assert_eq(bytes_of(f), [0xB5, 0x62, 0x06, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x21, 0x30,
+        0xEB, 0x07])
+
+fn bytes_of(f: Vec[u8; 40]) -> [Int]
+    var xs: [Int] = []
+    for i in 0..f.len()
+        list.push(xs, f[i] as Int)
+    xs
+
+@test
+fn test_a_key_has_its_size_in_bits_30_to_28() [io, hw]
+    test.assert_eq(ubx.key_size(0x10740001), 1)
+    test.assert_eq(ubx.key_size(0x20910007), 1)
+    test.assert_eq(ubx.key_size(0x30210001), 2)
+    test.assert_eq(ubx.key_size(0x40520001), 4)
+    test.assert_eq(ubx.key_size(0x50000001), 8)
+    test.assert_eq(ubx.key_size(0x00000001), 0)
+    test.assert_eq(ubx.key_size(0x60000001), 0)
+    // A value of 8 bytes, and a key with no size code, are not built.
+    var f: Vec[u8; 40] = Vec.new()
+    test.assert(not ubx.build_valset(var f, ubx.LAYER_RAM, 0x50000001, 1))
+    test.assert(not ubx.build_valset(var f, ubx.LAYER_RAM, 0x00000001, 1))
+
+// ── The reader ───────────────────────────────────────────────────────
+
+@test
+fn test_the_reader_finds_a_frame_and_keeps_its_payload() [io, hw]
+    var r = ubx.reader_new()
+    let f = pvt_frame()
+    for i in 0..f.len() - 1
+        test.assert_eq(ubx.push(var r, f[i]), ubx.PUSH_NONE)
+    test.assert_eq(ubx.push(var r, f[f.len() - 1]), ubx.PUSH_FRAME)
+    test.assert(ubx.is_message(var r, 1, 7, 92))
+    test.assert(not ubx.is_message(var r, 1, 7, 91))
+    test.assert(not ubx.is_message(var r, 1, 8, 92))
+    test.assert(not ubx.is_message(var r, 2, 7, 92))
+    test.assert_eq(r.payload.len(), 92)
+    test.assert_eq(r.payload[23] as Int, 12)
+
+@test
+fn test_nmea_text_and_stray_bytes_between_frames_are_skipped() [io, hw]
+    var r = ubx.reader_new()
+    // A sentence, then a 0xB5 that is not a sync, then a 0xB5 0xB5 0x62 and
+    // the frame.
+    let text = gga()
+    for b in text
+        test.assert_eq(ubx.push(var r, b), ubx.PUSH_NONE)
+    test.assert_eq(ubx.push(var r, 0xB5), ubx.PUSH_NONE)
+    test.assert_eq(ubx.push(var r, 0x00), ubx.PUSH_NONE)
+    test.assert_eq(ubx.push(var r, 0xB5), ubx.PUSH_NONE)
+    test.assert_eq(push_all(var r, pvt_frame()), ubx.PUSH_FRAME)
+    test.assert(ubx.is_message(var r, 1, 7, 92))
+
+@test
+fn test_a_bad_checksum_drops_the_frame_and_the_reader_goes_on() [io, hw]
+    var r = ubx.reader_new()
+    var f = pvt_frame()
+    f[98] = 0x00
+    test.assert_eq(push_all(var r, f), ubx.PUSH_BAD_SUM)
+    var g = pvt_frame()
+    g[99] = 0x00
+    test.assert_eq(push_all(var r, g), ubx.PUSH_BAD_SUM)
+    // A byte of the payload is wrong: CK_A differs.
+    var h = pvt_frame()
+    h[30] = 0x55
+    test.assert_eq(push_all(var r, h), ubx.PUSH_BAD_SUM)
+    test.assert_eq(push_all(var r, pvt_frame()), ubx.PUSH_FRAME)
+
+@test
+fn test_a_frame_with_no_payload_and_one_longer_than_the_buffer() [io, hw]
+    var r = ubx.reader_new()
+    test.assert_eq(push_all(var r, frame_of(0x0A, 0x04, [])), ubx.PUSH_FRAME)
+    test.assert_eq(r.len, 0)
+    test.assert_eq(r.payload.len(), 0)
+    // 300 bytes: the first 256 are kept, all 300 are checksummed and counted.
+    var big: [Int] = []
+    for i in 0..300
+        list.push(big, i & 0xFF)
+    test.assert_eq(push_all(var r, frame_of(0x0A, 0x04, big)), ubx.PUSH_FRAME)
+    test.assert_eq(r.len, 300)
+    test.assert_eq(r.payload.len(), 256)
+    test.assert_eq(r.payload[255] as Int, 255)
+    // The frame after it is found.
+    test.assert_eq(push_all(var r, pvt_frame()), ubx.PUSH_FRAME)
+
+// ── The navigation message ───────────────────────────────────────────
+
+fn pvt_reader(xs: [Int]) -> UbxReader
+    var r = ubx.reader_new()
+    let _ = push_all(var r, frame_of(1, 7, xs))
+    r
+
+@test
+fn test_the_navigation_fields_are_decoded_at_their_offsets() [io, hw]
+    var r = pvt_reader(pvt_payload())
+    let p = ubx.pvt_decode(var r)
+    test.assert_eq(p.itow, 1000000)
+    test.assert_eq(p.year, 2026)
+    test.assert_eq(p.month, 11)
+    test.assert_eq(p.day, 11)
+    test.assert_eq(p.hour, 12)
+    test.assert_eq(p.min, 34)
+    test.assert_eq(p.sec, 56)
+    test.assert_eq(p.valid, 7)
+    test.assert_eq(p.t_acc, 50)
+    test.assert_eq(p.nano, 123000000)
+    test.assert_eq(p.fix_type, 3)
+    test.assert_eq(p.flags, 1)
+    test.assert_eq(p.flags2, 0)
+    test.assert_eq(p.num_sv, 12)
+    test.assert_eq(p.lon, 115760000)
+    test.assert_eq(p.lat, 481373000)
+    test.assert_eq(p.height, 560000)
+    test.assert_eq(p.hmsl, 515000)
+    test.assert_eq(p.h_acc, 1500)
+    test.assert_eq(p.v_acc, 2300)
+    test.assert_eq(p.vel_n, 1000)
+    test.assert_eq(p.vel_e, -500)
+    test.assert_eq(p.vel_d, 0)
+    test.assert_eq(p.g_speed, 1118)
+    test.assert_eq(p.head_mot, 33343500)
+    test.assert_eq(p.s_acc, 200)
+    test.assert_eq(p.head_acc, 500000)
+    test.assert_eq(p.pdop, 150)
+    test.assert_eq(p.flags3, 0)
+
+@test
+fn test_the_navigation_frame_becomes_the_trait_s_fix() [io, hw]
+    var r = pvt_reader(pvt_payload())
+    let f = ubx.pvt_to_fix(ubx.pvt_decode(var r))
+    test.assert_eq(f.time.year, 2026)
+    test.assert_eq(f.time.month, 11)
+    test.assert_eq(f.time.day, 11)
+    test.assert_eq(f.time.hour, 12)
+    test.assert_eq(f.time.minute, 34)
+    test.assert_eq(f.time.second, 56)
+    test.assert_eq(f.millis, 123)
+    test.assert(f.kind == Fix3d)
+    test.assert_eq(f.lat_e7, 481373000)
+    test.assert_eq(f.lon_e7, 115760000)
+    test.assert_eq(f.alt_mm, 515000)
+    test.assert_eq(f.speed_mm_s, 1118)
+    test.assert_eq(f.course_mdeg, 333435)
+    test.assert_eq(f.sats_used, 12)
+    test.assert_eq(f.sats_in_view, 12)
+
+fn fix_of_changes(off: Int, n: Int, v: Int) -> GnssFix
+    var xs = pvt_payload()
+    put_le(var xs, off, n, v)
+    var r = pvt_reader(xs)
+    ubx.pvt_to_fix(ubx.pvt_decode(var r))
+
+@test
+fn test_the_fix_type_and_the_validity_flags_decide_the_kind() [io, hw]
+    // flags clear: gnssFixOK is 0, no fix, no position.
+    let bad = fix_of_changes(21, 1, 0)
+    test.assert(bad.kind == FixNone)
+    test.assert_eq(bad.lat_e7, 0)
+    test.assert_eq(bad.lon_e7, 0)
+    test.assert_eq(bad.alt_mm, 0)
+    test.assert_eq(bad.speed_mm_s, 0)
+    test.assert_eq(bad.course_mdeg, 0)
+    // The other fix types with gnssFixOK set.
+    test.assert(fix_of_changes(20, 1, 0).kind == FixNone)
+    test.assert(fix_of_changes(20, 1, 1).kind == FixDeadReckoning)
+    test.assert(fix_of_changes(20, 1, 2).kind == Fix2d)
+    test.assert(fix_of_changes(20, 1, 4).kind == Fix3d)
+    test.assert(fix_of_changes(20, 1, 9).kind == FixNone)
+    // Time only: a position the receiver has none of, the time kept.
+    let t = fix_of_changes(20, 1, 5)
+    test.assert(t.kind == FixTimeOnly)
+    test.assert_eq(t.lat_e7, 0)
+    test.assert_eq(t.time.hour, 12)
+    // Time only with gnssFixOK clear is still time only.
+    var xs = pvt_payload()
+    put_le(var xs, 20, 1, 5)
+    put_le(var xs, 21, 1, 0)
+    var r = pvt_reader(xs)
+    test.assert(ubx.pvt_to_fix(ubx.pvt_decode(var r)).kind == FixTimeOnly)
+    // invalidLlh (flags3 bit 0): the position is not one.
+    test.assert(fix_of_changes(78, 2, 1).kind == FixNone)
+
+@test
+fn test_the_time_is_zero_unless_the_date_and_the_time_are_valid() [io, hw]
+    for v in [0, 1, 2]
+        let f = fix_of_changes(11, 1, v)
+        test.assert_eq(f.time.year, 0)
+        test.assert_eq(f.time.hour, 0)
+        test.assert_eq(f.millis, 0)
+        test.assert(f.kind == Fix3d)
+    test.assert_eq(fix_of_changes(11, 1, 3).time.year, 2026)
+
+@test
+fn test_a_leap_second_is_59_and_a_negative_nano_borrows_a_second() [io, hw]
+    test.assert_eq(fix_of_changes(10, 1, 60).time.second, 59)
+    // nano -400 ms: the second is rounded up, the true time is 600 ms into
+    // the second before.
+    let f = fix_of_changes(16, 4, 0xFFFFFFFF - 399999999)
+    test.assert_eq(f.time.second, 55)
+    test.assert_eq(f.millis, 600)
+    // A nano of 0 and one of 999 ms.
+    test.assert_eq(fix_of_changes(16, 4, 0).millis, 0)
+    test.assert_eq(fix_of_changes(16, 4, 999999999).millis, 999)
+
+@test
+fn test_one_second_back_borrows_through_the_calendar() [io, hw]
+    let a = ubx.minus_second(RtcDateTime { year: 2026, month: 11, day: 11, hour: 12, minute: 34, second: 56 })
+    test.assert_eq(a.second, 55)
+    let b = ubx.minus_second(RtcDateTime { year: 2026, month: 11, day: 11, hour: 12, minute: 34, second: 0 })
+    test.assert_eq(b.minute, 33)
+    test.assert_eq(b.second, 59)
+    let c = ubx.minus_second(RtcDateTime { year: 2026, month: 11, day: 11, hour: 12, minute: 0, second: 0 })
+    test.assert_eq(c.hour, 11)
+    test.assert_eq(c.minute, 59)
+    test.assert_eq(c.second, 59)
+    let d = ubx.minus_second(RtcDateTime { year: 2026, month: 11, day: 11, hour: 0, minute: 0, second: 0 })
+    test.assert_eq(d.day, 10)
+    test.assert_eq(d.hour, 23)
+    // The first of March in a leap year goes back to the 29th of February.
+    let e = ubx.minus_second(RtcDateTime { year: 2028, month: 3, day: 1, hour: 0, minute: 0, second: 0 })
+    test.assert_eq(e.month, 2)
+    test.assert_eq(e.day, 29)
+    let f = ubx.minus_second(RtcDateTime { year: 2027, month: 3, day: 1, hour: 0, minute: 0, second: 0 })
+    test.assert_eq(f.day, 28)
+    // The first of January goes back to the last of December.
+    let g = ubx.minus_second(RtcDateTime { year: 2027, month: 1, day: 1, hour: 0, minute: 0, second: 0 })
+    test.assert_eq(g.year, 2026)
+    test.assert_eq(g.month, 12)
+    test.assert_eq(g.day, 31)
+    test.assert_eq(g.second, 59)
+
+@test
+fn test_speed_and_course_are_held_in_range() [io, hw]
+    // A negative speed (a reading below zero) is 0; a course of -90 degrees is
+    // 270 degrees; a course of 360 degrees is 0.
+    test.assert_eq(fix_of_changes(60, 4, 0xFFFFFFFF - 4).speed_mm_s, 0)
+    test.assert_eq(fix_of_changes(64, 4, 0xFFFFFFFF - 8999999).course_mdeg, 270000)
+    test.assert_eq(fix_of_changes(64, 4, 36000000).course_mdeg, 0)
+    test.assert_eq(fix_of_changes(64, 4, 35999999).course_mdeg, 359999)
+
+// ── Acknowledges and the version ─────────────────────────────────────
+
+@test
+fn test_an_acknowledge_names_the_message_it_answers() [io, hw]
+    var r = ubx.reader_new()
+    let _ = push_all(var r, ack_frame(true, 0x06, 0x8A))
+    test.assert_eq(ubx.ack_target(var r), 0x068A)
+    let _ = push_all(var r, ack_frame(false, 0x06, 0x01))
+    test.assert_eq(ubx.ack_target(var r), 0x0601)
+    // Another message, a wrong length, and an identifier that is neither.
+    let _ = push_all(var r, pvt_frame())
+    test.assert_eq(ubx.ack_target(var r), -1)
+    let _ = push_all(var r, frame_of(5, 1, [6]))
+    test.assert_eq(ubx.ack_target(var r), -1)
+    let _ = push_all(var r, frame_of(5, 2, [6, 1]))
+    test.assert_eq(ubx.ack_target(var r), -1)
+
+@test
+fn test_the_protocol_version_is_read_from_the_mon_ver_extension() [io, hw]
+    var r = ubx.reader_new()
+    let _ = push_all(var r, ver_frame("PROTVER=32.01"))
+    test.assert_eq(ubx.protver_of(var r), 3201)
+    let _ = push_all(var r, ver_frame("PROTVER=18.00"))
+    test.assert_eq(ubx.protver_of(var r), 1800)
+    // No minor part, and no digits.
+    let _ = push_all(var r, ver_frame("PROTVER=32"))
+    test.assert_eq(ubx.protver_of(var r), 3200)
+    let _ = push_all(var r, ver_frame("PROTVER=x"))
+    test.assert_eq(ubx.protver_of(var r), 0)
+    // A string that is not PROTVER, another message, a frame too short.
+    let _ = push_all(var r, ver_frame("FWVER=32.01"))
+    test.assert_eq(ubx.protver_of(var r), -1)
+    let _ = push_all(var r, pvt_frame())
+    test.assert_eq(ubx.protver_of(var r), -1)
+    let _ = push_all(var r, frame_of(0x0A, 0x04, [1, 2, 3]))
+    test.assert_eq(ubx.protver_of(var r), -1)
+    // PROTVER where the buffer ends: the string at 100 is read.
+    var xs = ver_payload("")
+    for i in 100..130
+        xs[i] = 0
+    put_text(var xs, 100, "PROTVER=23.01")
+    let _ = push_all(var r, frame_of(0x0A, 0x04, xs))
+    test.assert_eq(ubx.protver_of(var r), 2301)
+
+// ── NMEA ─────────────────────────────────────────────────────────────
+
+fn nmea_all(var rd: NmeaReader, xs: [Int]) -> Int
+    var last = nmea.NMEA_NONE
+    for b in xs
+        let r = nmea.push(var rd, b)
+        if r != nmea.NMEA_NONE
+            last = r
+    last
+
+@test
+fn test_a_gga_and_an_rmc_with_the_same_time_make_a_fix() [io, hw]
+    var rd = nmea.reader_new()
+    test.assert_eq(nmea_all(var rd, gga()), nmea.NMEA_USED)
+    test.assert(not rd.fresh)
+    test.assert_eq(nmea_all(var rd, rmc()), nmea.NMEA_USED)
+    test.assert(rd.fresh)
+    let f = nmea.fix_of(rd)
+    test.assert(f.kind == Fix3d)
+    test.assert_eq(f.time.year, 2026)
+    test.assert_eq(f.time.month, 11)
+    test.assert_eq(f.time.day, 11)
+    test.assert_eq(f.time.hour, 12)
+    test.assert_eq(f.time.minute, 34)
+    test.assert_eq(f.time.second, 56)
+    test.assert_eq(f.millis, 0)
+    test.assert_eq(f.lat_e7, 481173000)
+    test.assert_eq(f.lon_e7, 115166666)
+    test.assert_eq(f.alt_mm, 545400)
+    test.assert_eq(f.speed_mm_s, 11523)
+    test.assert_eq(f.course_mdeg, 84400)
+    test.assert_eq(f.sats_used, 12)
+    test.assert_eq(f.sats_in_view, 12)
+
+@test
+fn test_the_order_does_not_matter_and_a_different_time_does_not_complete() [io, hw]
+    var rd = nmea.reader_new()
+    test.assert_eq(nmea_all(var rd, rmc()), nmea.NMEA_USED)
+    test.assert(not rd.fresh)
+    test.assert_eq(nmea_all(var rd, gga()), nmea.NMEA_USED)
+    test.assert(rd.fresh)
+    var other = nmea.reader_new()
+    let _ = nmea_all(var other, rmc())
+    let _ = nmea_all(var other, sentence("GNGGA,123457.00,4807.038,N,01131.000,E,1,12,0.9,545.4,M,46.9,M,,"))
+    test.assert(not other.fresh)
+
+@test
+fn test_a_bad_checksum_a_long_line_and_other_sentences_are_not_used() [io, hw]
+    var rd = nmea.reader_new()
+    var bad = gga()
+    bad[10] = 55
+    test.assert_eq(nmea_all(var rd, bad), nmea.NMEA_BAD)
+    test.assert_eq(nmea_all(var rd, sentence("GNGSV,3,1,12,01,40,083,46,02,17,308,41,12,07,344,39,14,22,228,45")),
+        nmea.NMEA_OTHER)
+    // A sentence of a few characters with no star; a lone line end.
+    test.assert_eq(nmea_all(var rd, text_bytes("\$GN\r\n")), nmea.NMEA_BAD)
+    test.assert_eq(nmea_all(var rd, [13, 10]), nmea.NMEA_NONE)
+    // 101 characters: the sentence is dropped without a verdict.
+    var long: [Int] = [36]
+    for _i in 0..101
+        list.push(long, 65)
+    list.push(long, 10)
+    test.assert_eq(nmea_all(var rd, long), nmea.NMEA_NONE)
+    // Text before a `$` is not a sentence.
+    test.assert_eq(nmea_all(var rd, text_bytes("noise")), nmea.NMEA_NONE)
+    // A checksum with a character that is not a hex digit.
+    var nothex = gga()
+    nothex[nothex.len() - 4] = 71
+    test.assert_eq(nmea_all(var rd, nothex), nmea.NMEA_BAD)
+    test.assert_eq(nmea_all(var rd, gga()), nmea.NMEA_USED)
+
+@test
+fn test_no_fix_quality_and_status_give_no_fix() [io, hw]
+    var rd = nmea.reader_new()
+    let _ = nmea_all(var rd, sentence("GNGGA,123456.00,,,,,0,00,99.99,,,,,,"))
+    let _ = nmea_all(var rd, sentence("GNRMC,123456.00,V,,,,,,,111126,,,N,V"))
+    test.assert(rd.fresh)
+    let f = nmea.fix_of(rd)
+    test.assert(f.kind == FixNone)
+    test.assert_eq(f.lat_e7, 0)
+    test.assert_eq(f.alt_mm, 0)
+    test.assert_eq(f.sats_used, 0)
+    test.assert_eq(f.time.hour, 12)
+
+@test
+fn test_the_kinds_south_west_and_missing_fields() [io, hw]
+    test.assert(nmea.kind_of(1, true, true) == Fix3d)
+    test.assert(nmea.kind_of(2, true, false) == Fix2d)
+    test.assert(nmea.kind_of(6, true, true) == FixDeadReckoning)
+    test.assert(nmea.kind_of(0, true, true) == FixNone)
+    test.assert(nmea.kind_of(1, false, true) == FixNone)
+    var rd = nmea.reader_new()
+    // South and west, a negative altitude, no altitude digits after the point,
+    // no speed or course, and quality 6.
+    let _ = nmea_all(var rd, sentence("GNGGA,000001.50,3351.000,S,15112.000,W,6,04,1.0,-12,M,0,M,,"))
+    let _ = nmea_all(var rd, sentence("GNRMC,000001.50,A,3351.000,S,15112.000,W,,,010100,,,A,V"))
+    test.assert(rd.fresh)
+    let f = nmea.fix_of(rd)
+    test.assert(f.kind == FixDeadReckoning)
+    test.assert_eq(f.lat_e7, 0 - 338500000)
+    test.assert_eq(f.lon_e7, 0 - 1512000000 / 10 * 10 / 1)
+    test.assert_eq(f.alt_mm, -12000)
+    test.assert_eq(f.speed_mm_s, 0)
+    test.assert_eq(f.course_mdeg, 0)
+    test.assert_eq(f.millis, 500)
+    test.assert_eq(f.time.second, 1)
+    test.assert_eq(f.time.year, 2000)
+    // A GGA with no altitude field makes a 2D fix.
+    var two = nmea.reader_new()
+    let _ = nmea_all(var two, sentence("GNGGA,123456.00,4807.038,N,01131.000,E,1,05,0.9,,M,,M,,"))
+    let _ = nmea_all(var two, rmc())
+    test.assert(nmea.fix_of(two).kind == Fix2d)
+
+@test
+fn test_truncated_sentences_and_empty_fields_are_read_as_empty() [io, hw]
+    var rd = nmea.reader_new()
+    // Sentences with too few fields: the missing ones read as empty.
+    test.assert_eq(nmea_all(var rd, sentence("GNGGA,123456.00,4807.038")), nmea.NMEA_USED)
+    test.assert_eq(nmea_all(var rd, sentence("GNRMC,123456.00")), nmea.NMEA_USED)
+    test.assert(rd.fresh)
+    let f = nmea.fix_of(rd)
+    test.assert(f.kind == FixNone)
+    // A GGA whose time is empty is not complete.
+    var e = nmea.reader_new()
+    let _ = nmea_all(var e, sentence("GNGGA,,4807.038,N,01131.000,E,1,12,0.9,545.4,M,46.9,M,,"))
+    let _ = nmea_all(var e, sentence("GNRMC,,A,4807.038,N,01131.000,E,022.4,084.4,111126,003.1,W,A,V"))
+    test.assert(not e.fresh)
+    // Hemispheres left empty read as north and east.
+    var h = nmea.reader_new()
+    let _ = nmea_all(var h, sentence("GNGGA,123456.00,4807.038,,01131.000,,1,12,0.9,545.4,M,46.9,M,,"))
+    let _ = nmea_all(var h, rmc())
+    test.assert_eq(nmea.fix_of(h).lat_e7, 481173000)
+    // A lone `$` and a line end.
+    test.assert_eq(nmea_all(var h, text_bytes("\$\r\n")), nmea.NMEA_NONE)
+
+@test
+fn test_hex_digits() [io, hw]
+    test.assert_eq(nmea.hex_of(48), 0)
+    test.assert_eq(nmea.hex_of(57), 9)
+    test.assert_eq(nmea.hex_of(65), 10)
+    test.assert_eq(nmea.hex_of(70), 15)
+    test.assert_eq(nmea.hex_of(97), 10)
+    test.assert_eq(nmea.hex_of(102), 15)
+    test.assert_eq(nmea.hex_of(71), -1)
+    test.assert_eq(nmea.hex_of(103), -1)
+    test.assert_eq(nmea.hex_of(47), -1)
+
+// ── A stream ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_navigation_frame_becomes_the_latest_fix_once() [io, hw, mutate]
+    var c = neo.core_new()
+    test.assert(is_none(neo.take_fix(var c)))
+    feed_all(var c, pvt_frame())
+    test.assert_eq(c.pvt_frames, 1)
+    let f = fix_or(neo.take_new_fix(var c))
+    test.assert(f.kind == Fix3d)
+    test.assert_eq(f.lat_e7, 481373000)
+    // Taken: not new any more, but the latest is still there.
+    test.assert(is_none(neo.take_new_fix(var c)))
+    test.assert(not is_none(neo.take_fix(var c)))
+    feed_all(var c, pvt_frame())
+    test.assert(not is_none(neo.take_fix(var c)))
+    test.assert(is_none(neo.take_new_fix(var c)))
+
+@test
+fn test_nmea_is_the_fallback_until_a_navigation_frame_arrives() [io, hw, mutate]
+    var c = neo.core_new()
+    feed_all(var c, gga())
+    feed_all(var c, rmc())
+    test.assert_eq(c.pvt_frames, 0)
+    test.assert_eq(fix_or(neo.take_new_fix(var c)).lat_e7, 481173000)
+    feed_all(var c, pvt_frame())
+    test.assert_eq(fix_or(neo.take_new_fix(var c)).lat_e7, 481373000)
+    // With a navigation frame seen, the same epoch's NMEA is ignored.
+    feed_all(var c, gga())
+    feed_all(var c, rmc())
+    test.assert(is_none(neo.take_new_fix(var c)))
+
+@test
+fn test_a_bad_frame_is_counted_and_acknowledges_and_versions_are_remembered() [io, hw, mutate]
+    var c = neo.core_new()
+    var f = pvt_frame()
+    f[98] = 0
+    feed_all(var c, f)
+    test.assert_eq(c.bad_frames, 1)
+    test.assert(is_none(neo.take_fix(var c)))
+    feed_all(var c, ack_frame(true, 0x06, 0x01))
+    test.assert_eq(c.ack_msg, 0x0601)
+    test.assert(c.ack_ok)
+    feed_all(var c, ack_frame(false, 0x06, 0x8A))
+    test.assert_eq(c.ack_msg, 0x068A)
+    test.assert(not c.ack_ok)
+    feed_all(var c, ver_frame("PROTVER=32.01"))
+    test.assert_eq(c.protver, 3201)
+    // A frame the driver does not read changes nothing.
+    feed_all(var c, frame_of(0x0A, 0x09, [1, 2]))
+    test.assert_eq(c.protver, 3201)
+    // A navigation frame of another length is not a fix.
+    feed_all(var c, frame_of(1, 7, [1, 2, 3]))
+    test.assert(is_none(neo.take_fix(var c)))
+
+// ── A port and the commands ──────────────────────────────────────────
+//
+// The port plays back one response for each frame the driver sends: when a
+// frame is complete, the next response becomes readable.  `st` is the state:
+// 0 the read cursor, 1 the bytes readable now, 2 the bytes sent, 3 the
+// milliseconds paused, 4 the baud rate set, 5 the number of times it was set,
+// 6 the start of the frame being sent, 7 the frames sent, 8 the number of
+// responses; 100 and up the cumulative length of the responses.
+
+struct FakePort
+    st: HashMap<Int, Int>
+    rx: HashMap<Int, Int>
+    tx: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+@tier(app)
+fn port(responses: [[Int]]) -> FakePort
+    let p = FakePort { st: HashMap.new(), rx: HashMap.new(), tx: HashMap.new() }
+    var n = 0
+    var total = 0
+    for r in responses
+        for b in r
+            p.rx.insert(total, b)
+            total = total + 1
+        p.st.insert(100 + n, total)
+        n = n + 1
+    p.st.insert(8, n)
+    p
+
+impl NeoPort for FakePort
+    fn port_get(self) -> Int [hw]
+        let i = at(self.st, 0)
+        if i >= at(self.st, 1)
+            return -1
+        self.st.insert(0, i + 1)
+        at(self.rx, i)
+
+    fn port_put(self, b: Int) [hw]
+        let n = at(self.st, 2)
+        self.tx.insert(n, b)
+        self.st.insert(2, n + 1)
+        let start = at(self.st, 6)
+        let have = n + 1 - start
+        if have >= 6
+            let want = 8 + at(self.tx, start + 4) + (at(self.tx, start + 5) << 8)
+            if have == want
+                let k = at(self.st, 7)
+                self.st.insert(6, n + 1)
+                self.st.insert(7, k + 1)
+                if k < at(self.st, 8)
+                    self.st.insert(1, at(self.st, 100 + k))
+
+    fn port_pause_ms(self, ms: Int) [hw]
+        self.st.insert(3, at(self.st, 3) + ms)
+
+    fn port_baud(self, baud: Int) [hw]
+        self.st.insert(4, baud)
+        self.st.insert(5, at(self.st, 5) + 1)
+
+fn sent(p: FakePort) -> [Int]
+    var xs: [Int] = []
+    for i in 0..at(p.st, 2)
+        list.push(xs, at(p.tx, i))
+    xs
+
+fn joined(a: [Int], b: [Int]) -> [Int]
+    var xs: [Int] = []
+    for x in a
+        list.push(xs, x)
+    for x in b
+        list.push(xs, x)
+    xs
+
+@test
+fn test_pump_reads_what_waits_and_stops_at_the_end_of_the_line() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([pvt_frame()])
+    p.st.insert(1, 100)
+    test.assert_eq(neo.pump(p, var c, 512), 100)
+    test.assert_eq(c.pvt_frames, 1)
+    // A limit below what waits.
+    let q = port([pvt_frame()])
+    q.st.insert(1, 100)
+    var d = neo.core_new()
+    test.assert_eq(neo.pump(q, var d, 10), 10)
+    test.assert_eq(d.pvt_frames, 0)
+
+@test
+fn test_a_command_waits_for_its_acknowledge() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([ack_frame(true, 0x06, 0x01)])
+    var f: Vec[u8; 40] = Vec.new()
+    ubx.build_cfg_msg(var f, 1, 7, 1)
+    test.assert(neo.command(p, var c, var f, 0x06, 0x01))
+    test.assert_eq(sent(p), [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0x01, 0x07, 0x01, 0x13, 0x51])
+    // A negative acknowledge.
+    let n = port([ack_frame(false, 0x06, 0x01)])
+    test.assert(not neo.command(n, var c, var f, 0x06, 0x01))
+    // An acknowledge of another message is not the answer, and silence ends
+    // after a second.
+    let o = port([ack_frame(true, 0x06, 0x8A)])
+    test.assert(not neo.command(o, var c, var f, 0x06, 0x01))
+    test.assert_eq(at(o.st, 3), 1000)
+    let s = port([])
+    test.assert(not neo.command(s, var c, var f, 0x06, 0x01))
+    test.assert_eq(at(s.st, 3), 1000)
+
+@test
+fn test_frames_are_finished_sent_and_the_fix_kind_follows_the_flags() [io, hw, mutate]
+    // finish appends the checksum of the bytes after the sync.
+    var f: Vec[u8; 40] = Vec.new()
+    for b in [0xB5, 0x62, 0x05, 0x01, 0x02, 0x00, 0x06, 0x01]
+        let _ = f.push(b as u8)
+    ubx.finish(var f)
+    test.assert_eq(f.len(), 10)
+    test.assert_eq(f[8] as Int, 0x0F)
+    test.assert_eq(f[9] as Int, 0x38)
+    // send writes each byte to the port.
+    let p = port([])
+    neo.send(p, var f)
+    test.assert_eq(sent(p), bytes_of(f))
+    // set_period sends the M9's or the M8's message.
+    var c = neo.core_new()
+    let q = port([ack_frame(true, 0x06, 0x8A)])
+    test.assert(neo.set_period(q, var c, neo.MODEL_M9N, 200))
+    let r = port([ack_frame(true, 0x06, 0x08)])
+    test.assert(neo.set_period(r, var c, neo.MODEL_M8N, 200))
+    // fix_kind: the fix type, gnssFixOK and invalidLlh.
+    test.assert(ubx.fix_kind(3, true, false) == Fix3d)
+    test.assert(ubx.fix_kind(3, false, false) == FixNone)
+    test.assert(ubx.fix_kind(3, true, true) == FixNone)
+    test.assert(ubx.fix_kind(5, false, true) == FixTimeOnly)
+
+@test
+fn test_the_period_of_a_rate_rounds_up_to_the_models_minimum() [io, hw]
+    test.assert_eq(neo.rate_mhz_to_ms(1000, neo.MODEL_M9N), 1000)
+    test.assert_eq(neo.rate_mhz_to_ms(10000, neo.MODEL_M9N), 100)
+    // 3 Hz is 333.3 ms: 334 ms, a rate of 2.994 Hz at or below 3 Hz.
+    test.assert_eq(neo.rate_mhz_to_ms(3000, neo.MODEL_M9N), 334)
+    // 40 Hz is 25 ms on the M9 and is raised to 50 ms on the M8.
+    test.assert_eq(neo.rate_mhz_to_ms(40000, neo.MODEL_M9N), 25)
+    test.assert_eq(neo.rate_mhz_to_ms(40000, neo.MODEL_M8N), 50)
+    test.assert_eq(neo.rate_mhz_to_ms(100000, neo.MODEL_M9N), 25)
+    // The slowest rate the 16-bit field holds is 65535 ms, 15.26 mHz.
+    test.assert_eq(neo.rate_mhz_to_ms(16, neo.MODEL_M9N), 62500)
+    test.assert_eq(neo.rate_mhz_to_ms(15, neo.MODEL_M9N), 0)
+    test.assert_eq(neo.rate_mhz_to_ms(0, neo.MODEL_M9N), 0)
+    test.assert_eq(neo.rate_mhz_to_ms(-5, neo.MODEL_M9N), 0)
+    test.assert_eq(neo.min_period_ms(neo.MODEL_M9N), 25)
+    test.assert_eq(neo.min_period_ms(neo.MODEL_M8N), 50)
+
+@test
+fn test_the_rate_is_set_by_valset_on_the_m9_and_by_cfg_rate_on_the_m8() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([ack_frame(true, 0x06, 0x8A)])
+    test.assert_eq(neo.set_rate_mhz(p, var c, neo.MODEL_M9N, 1000), 1000)
+    test.assert_eq(sent(p), [0xB5, 0x62, 0x06, 0x8A, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x21, 0x30,
+        0xE8, 0x03, 0xD8, 0xC4])
+    let q = port([ack_frame(true, 0x06, 0x08)])
+    test.assert_eq(neo.set_rate_mhz(q, var c, neo.MODEL_M8N, 1000), 1000)
+    test.assert_eq(sent(q), [0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0xE8, 0x03, 0x01, 0x00, 0x01, 0x00, 0x01, 0x39])
+    // 3 Hz asked: 334 ms taken, 2994 mHz answered.
+    let r = port([ack_frame(true, 0x06, 0x8A)])
+    test.assert_eq(neo.set_rate_mhz(r, var c, neo.MODEL_M9N, 3000), 2994)
+    // A rate that does not fit costs no byte; a refusal answers 0.
+    let s = port([])
+    test.assert_eq(neo.set_rate_mhz(s, var c, neo.MODEL_M9N, 5), 0)
+    test.assert_eq(at(s.st, 2), 0)
+    let t = port([ack_frame(false, 0x06, 0x8A)])
+    test.assert_eq(neo.set_rate_mhz(t, var c, neo.MODEL_M9N, 1000), 0)
+
+@test
+fn test_pvt_output_is_enabled_with_two_valsets_on_the_m9_and_cfg_msg_on_the_m8() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([ack_frame(true, 0x06, 0x8A), ack_frame(true, 0x06, 0x8A)])
+    test.assert(neo.enable_pvt(p, var c, neo.MODEL_M9N))
+    let one = [0xB5,
+        0x62,
+        0x06,
+        0x8A,
+        0x09,
+        0x00,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        0x01,
+        0x00,
+        0x74,
+        0x10,
+        0x01,
+        0x20,
+        0xB3]
+    let two = frame_of(0x06, 0x8A, [0, 1, 0, 0, 0x07, 0x00, 0x91, 0x20, 1])
+    test.assert_eq(sent(p), joined(one, two))
+    // The first refused: the second is not sent.
+    let n = port([ack_frame(false, 0x06, 0x8A)])
+    test.assert(not neo.enable_pvt(n, var c, neo.MODEL_M9N))
+    test.assert_eq(at(n.st, 7), 1)
+    let m = port([ack_frame(true, 0x06, 0x8A), ack_frame(false, 0x06, 0x8A)])
+    test.assert(not neo.enable_pvt(m, var c, neo.MODEL_M9N))
+    let q = port([ack_frame(true, 0x06, 0x01)])
+    test.assert(neo.enable_pvt(q, var c, neo.MODEL_M8N))
+    test.assert_eq(sent(q), [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0x01, 0x07, 0x01, 0x13, 0x51])
+
+@test
+fn test_nmea_is_switched_off_by_valset_on_the_m9_and_by_cfg_prt_on_the_m8() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([ack_frame(true, 0x06, 0x8A)])
+    test.assert(neo.nmea_off(p, var c, neo.MODEL_M9N, 9600))
+    test.assert_eq(sent(p), frame_of(0x06, 0x8A, [0, 1, 0, 0, 0x02, 0x00, 0x74, 0x10, 0]))
+    // The M8: UART 1 at the baud rate given, UBX and NMEA in (3), UBX out (1).
+    let q = port([ack_frame(true, 0x06, 0x00)])
+    test.assert(neo.nmea_off(q, var c, neo.MODEL_M8N, 9600))
+    var f: Vec[u8; 40] = Vec.new()
+    ubx.build_cfg_prt_uart1(var f, 9600, 3, 1)
+    test.assert_eq(sent(q), bytes_of(f))
+
+@test
+fn test_the_baud_rate_changes_at_the_receiver_first_and_then_at_the_host() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([ack_frame(true, 0x06, 0x8A)])
+    test.assert(neo.change_baud(p, var c, neo.MODEL_M9N, 115200))
+    test.assert_eq(sent(p), [0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40,
+        0x00, 0xC2, 0x01, 0x00, 0xF3, 0xA5])
+    test.assert_eq(at(p.st, 4), 115200)
+    test.assert_eq(at(p.st, 5), 1)
+    // The wait after the acknowledge is a second.
+    test.assert_eq(at(p.st, 3), 1000)
+    let q = port([ack_frame(true, 0x06, 0x00)])
+    test.assert(neo.change_baud(q, var c, neo.MODEL_M8N, 38400))
+    test.assert_eq(at(q.st, 4), 38400)
+    var f: Vec[u8; 40] = Vec.new()
+    ubx.build_cfg_prt_uart1(var f, 38400, 3, 3)
+    test.assert_eq(sent(q), bytes_of(f))
+    // No acknowledge: the host's line is left alone.
+    let r = port([])
+    test.assert(not neo.change_baud(r, var c, neo.MODEL_M9N, 115200))
+    test.assert_eq(at(r.st, 5), 0)
+
+@test
+fn test_begin_opens_the_line_enables_the_output_and_reads_the_version() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([ack_frame(true, 0x06, 0x8A), ack_frame(true, 0x06, 0x8A), ver_frame("PROTVER=32.01")])
+    test.assert(neo.begin_with(p, var c, neo.MODEL_M9N, 9600))
+    test.assert_eq(at(p.st, 4), 9600)
+    test.assert_eq(at(p.st, 7), 3)
+    test.assert_eq(c.protver, 3201)
+    // The output is not acknowledged; the version is not named.
+    let q = port([ack_frame(false, 0x06, 0x8A)])
+    test.assert(not neo.begin_with(q, var c, neo.MODEL_M9N, 9600))
+    let r = port([ack_frame(true, 0x06, 0x01)])
+    test.assert(not neo.begin_with(r, var c, neo.MODEL_M8N, 9600))
+
+@test
+fn test_the_identity_is_the_protocol_version() [io, hw, mutate]
+    var c = neo.core_new()
+    let p = port([ver_frame("PROTVER=32.01")])
+    test.assert_eq(neo.identify(p, var c), 3201)
+    test.assert_eq(sent(p), frame_of(0x0A, 0x04, []))
+    let q = port([])
+    test.assert_eq(neo.identify(q, var c), -1)
+    test.assert_eq(at(q.st, 3), 1000)
+    match neo.id_of_protver(3201)
+        Some(i) =>
+            test.assert_eq(i.who, 32)
+            test.assert(i.rev == Some(1))
+        None    => test.assert(false)
+    test.assert(neo.id_of_protver(-1) == None)
+
+// ── The type on the shared stream ────────────────────────────────────
+
+fn receiver() -> Neo
+    Neo.attach(BoardUart { id: 0 }, neo.MODEL_M9N)
+
+@test
+fn test_the_trait_methods_read_the_shared_stream() [io, hw, mutate]
+    neo.shared_reset()
+    let r = receiver()
+    // Before any byte: no record.
+    test.assert(is_none(r.gnss_fix()))
+    test.assert(is_none(r.gnss_fix_new()))
+    // The shared stream completes a fix; the line has nothing more.
+    var seen: Int = 0
+    for b in pvt_frame()
+        match neo.shared_feed(b)
+            Some(_f) =>
+                seen = seen + 1
+            None     => ()
+    test.assert_eq(seen, 1)
+    test.assert_eq(r.pvt_frames(), 1)
+    test.assert_eq(r.bad_frames(), 0)
+    // The fix was taken by shared_feed; gnss_fix still answers the latest.
+    test.assert_eq(fix_or(r.gnss_fix()).lat_e7, 481373000)
+    test.assert(is_none(r.gnss_fix_new()))
+    // Another frame is new once.
+    for b in pvt_frame()
+        neo.shared_push(b)
+    test.assert_eq(fix_or(r.gnss_fix_new()).sats_used, 12)
+    test.assert(is_none(r.gnss_fix_new()))
+
+@test
+fn test_the_type_over_a_line_with_no_receiver() [io, hw, mutate]
+    neo.shared_reset()
+    let r = receiver()
+    test.assert_eq(r.poll(), 0)
+    test.assert(not r.begin(9600))
+    test.assert_eq(r.protocol_version(), -1)
+    test.assert(not r.set_baud(115200))
+    test.assert(not r.set_nmea_off(9600))
+    test.assert_eq(r.gnss_set_rate_mhz(1000), 0)
+    test.assert_eq(r.gnss_set_rate_mhz(5), 0)
+    test.assert(r.device_id() == None)
+    test.assert(not r.device_probe(32))
+    let m8 = Neo.attach(BoardUart { id: 0 }, neo.MODEL_M8N)
+    test.assert(not m8.begin(9600))
+
+// ── The DDC form ─────────────────────────────────────────────────────
+
+// An I2C bus with the receiver at 0x42: the byte count at 0xFD and 0xFE, the
+// stream at 0xFF, and the bytes written to it.  `st`: 0 the stream cursor, 1
+// the bytes in the stream, 2 the bytes written, 3 the reads that still
+// answer (-1 for all), 4 the writes that are acknowledged (-1 for all).
+
+struct FakeDdc
+    st: HashMap<Int, Int>
+    rx: HashMap<Int, Int>
+    tx: HashMap<Int, Int>
+
+impl I2cBus for FakeDdc
+    fn init(self, freq: Int) [hw]
+        self.st.insert(9, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != 0x42 or at(self.st, 4) == 0
+            return false
+        for b in data
+            let n = at(self.st, 2)
+            self.tx.insert(n, b as Int)
+            self.st.insert(2, n + 1)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != 0x42
+            return None
+        let left = at(self.st, 3)
+        if left == 0
+            return None
+        if left > 0
+            self.st.insert(3, left - 1)
+        var out: [u8] = []
+        if tx[0] == 0xFD
+            let count = at(self.st, 1) - at(self.st, 0)
+            list.push(out, ((count >> 8) & 0xFF) as u8)
+            list.push(out, (count & 0xFF) as u8)
+            return Some(out)
+        for _i in 0..n
+            let i = at(self.st, 0)
+            list.push(out, at(self.rx, i) as u8)
+            self.st.insert(0, i + 1)
+        Some(out)
+
+@tier(app)
+fn ddc(xs: [Int]) -> FakeDdc
+    let d = FakeDdc { st: HashMap.new(), rx: HashMap.new(), tx: HashMap.new() }
+    d.st.insert(3, -1)
+    d.st.insert(4, -1)
+    for i in 0..xs.len()
+        d.rx.insert(i, xs[i])
+    d.st.insert(1, xs.len())
+    d
+
+fn ddc_wiring() -> DeviceWiring
+    dev_bus.wiring_i2c(0, 0x42)
+
+@test
+fn test_the_byte_count_is_read_from_fd_and_fe_together() [io, hw]
+    let d = ddc(pvt_frame())
+    test.assert_eq(neo_ddc.ddc_available(d, ddc_wiring()), 100)
+    test.assert_eq(neo_ddc.ddc_available(ddc([]), ddc_wiring()), 0)
+    let off = ddc([1, 2])
+    off.st.insert(3, 0)
+    test.assert_eq(neo_ddc.ddc_available(off, ddc_wiring()), -1)
+    test.assert_eq(neo_ddc.DDC_ADDR, 0x42)
+    test.assert(neo_ddc.ddc_ready(d, ddc_wiring()))
+    test.assert_eq(at(d.st, 9), 400000)
+    test.assert(not neo_ddc.ddc_ready(d, dev_bus.wiring_spi(0, 5)))
+
+@test
+fn test_the_stream_is_read_for_the_counted_bytes_and_in_pieces_of_32() [io, hw, mutate]
+    var c = neo.core_new()
+    let d = ddc(pvt_frame())
+    // 100 bytes wait: 32, 32, 32, 4.
+    test.assert_eq(neo_ddc.ddc_pump(d, ddc_wiring(), var c, 512), 32)
+    test.assert_eq(neo_ddc.ddc_pump(d, ddc_wiring(), var c, 512), 32)
+    test.assert_eq(neo_ddc.ddc_pump(d, ddc_wiring(), var c, 512), 32)
+    test.assert_eq(neo_ddc.ddc_pump(d, ddc_wiring(), var c, 512), 4)
+    test.assert_eq(c.pvt_frames, 1)
+    // Nothing waits any more.
+    test.assert_eq(neo_ddc.ddc_pump(d, ddc_wiring(), var c, 512), 0)
+    // The limit is the caller's when it is below 32.
+    let e = ddc(pvt_frame())
+    test.assert_eq(neo_ddc.ddc_pump(e, ddc_wiring(), var c, 10), 10)
+    // The receiver does not answer at the count, or at the stream.
+    let f = ddc(pvt_frame())
+    f.st.insert(3, 0)
+    test.assert_eq(neo_ddc.ddc_pump(f, ddc_wiring(), var c, 512), -1)
+    let g = ddc(pvt_frame())
+    g.st.insert(3, 1)
+    test.assert_eq(neo_ddc.ddc_pump(g, ddc_wiring(), var c, 512), -1)
+
+@test
+fn test_a_frame_is_sent_in_one_write_with_no_register() [io, hw]
+    let d = ddc([])
+    var f: Vec[u8; 40] = Vec.new()
+    ubx.build_poll(var f, 0x0A, 0x04)
+    test.assert(neo_ddc.ddc_send(d, ddc_wiring(), var f))
+    test.assert_eq(at(d.st, 2), 8)
+    test.assert_eq(at(d.tx, 0), 0xB5)
+    test.assert_eq(at(d.tx, 7), 0x34)
+    d.st.insert(4, 0)
+    test.assert(not neo_ddc.ddc_send(d, ddc_wiring(), var f))
+    test.assert(not neo_ddc.ddc_send(d, dev_bus.wiring_spi(0, 5), var f))
+
+// ── The awaitable form ───────────────────────────────────────────────
+
+struct FakeRx
+    st: HashMap<Int, Int>
+    rx: HashMap<Int, Int>
+
+impl UartRxAsync for FakeRx
+    @tier(app)
+    async fn read_byte(self) -> Int [hw]
+        let i = at(self.st, 0)
+        if i >= at(self.st, 1)
+            return -1
+        self.st.insert(0, i + 1)
+        at(self.rx, i)
+
+    @tier(app)
+    async fn read_bytes(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _k in 0..n
+            let i = at(self.st, 0)
+            list.push(out, at(self.rx, i) as u8)
+            self.st.insert(0, i + 1)
+        out
+
+@tier(app)
+fn rx_of(xs: [Int]) -> FakeRx
+    let r = FakeRx { st: HashMap.new(), rx: HashMap.new() }
+    for i in 0..xs.len()
+        r.rx.insert(i, xs[i])
+    r.st.insert(1, xs.len())
+    r
+
+@tier(app)
+fn rx_async(r: FakeRx) -> NeoAsync<FakeRx>
+    NeoAsync { rx: r }
+
+@test
+fn test_an_awaited_fix_is_the_one_the_next_frame_completes() [io, hw, mutate, async]
+    neo.shared_reset()
+    var stream: [Int] = gga()
+    for b in pvt_frame()
+        list.push(stream, b)
+    let n = rx_async(rx_of(stream))
+    match await n.gnss_next()
+        Some(f) =>
+            test.assert(f.kind == Fix3d)
+            test.assert_eq(f.lat_e7, 481373000)
+        None    => test.assert(false)
+
+@test
+fn test_an_awaited_fix_ends_with_the_line() [io, hw, mutate, async]
+    neo.shared_reset()
+    let n = rx_async(rx_of(gga()))
+    test.assert(await n.gnss_next() == None)

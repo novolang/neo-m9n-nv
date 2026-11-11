@@ -1,0 +1,34 @@
+[package]
+name        = "neo-m9n-nv"
+version     = "0.1.0"
+description = "A driver for u-blox's NEO-M9N GNSS receiver, and the NEO-M8N as the second part of the family, over a UART or the DDC (I2C) port: the UBX frame with its checksum, a reader that walks caller-moved bytes and skips the NMEA text between frames, UBX-NAV-PVT as devices-nv's GnssFix, the acknowledgements, UBX-MON-VER as the identity, the navigation rate and the output messages by UBX-CFG-VALSET for the M9 and UBX-CFG-MSG, -RATE and -PRT for the M8, and a GGA and RMC reader with the NMEA checksum for a receiver whose UBX output is off, as devices-nv's Gnss and GnssAsync."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["neo-m9n", "neo-m8n", "u-blox", "ubx", "gnss", "gps", "nmea", "uart", "ddc", "i2c", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/neo-m9n-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# Every module of the package checks at the embedded tier, so a program
+# of any tier, embedded, rt or system, may call it.
+[tier]
+tier = "embedded"
+
+# The device program, examples/position_log.nv, has no [[bin]] entry: an
+# entry makes the registry list the package as a program, and a library
+# with an entry would be built by `novo install` for the host.
+# tests/device_build.sh builds the program for two boards as the main of
+# a scratch package that depends on this one.
+
+[docs.pages]
+"README.md" = "Reading a position from a u-blox NEO-M9N or NEO-M8N in a device program"
+
+[dependencies]
+# The board's UART, I2C and timer handles, and the UartRx, UartTx and I2cBus
+# traits they implement.
+embedded-hal-nv = "^0.3.3"
+# The Gnss trait and the fix it answers, the real-time clock's date and time,
+# the wiring record and the register helpers.
+devices-nv      = "^0.3.3"

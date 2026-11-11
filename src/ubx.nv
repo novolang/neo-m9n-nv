@@ -1,0 +1,567 @@
+// ubx — the u-blox binary protocol of the NEO-M9N and the NEO-M8N: the
+// frame, its Fletcher checksum, a reader that finds frames in a stream of
+// bytes, the messages the driver reads (UBX-NAV-PVT, UBX-ACK-ACK,
+// UBX-ACK-NAK and UBX-MON-VER) and the ones it sends (UBX-CFG-VALSET and
+// UBX-CFG-VALGET for the M9, UBX-CFG-MSG, UBX-CFG-RATE and UBX-CFG-PRT for
+// the M8, UBX-MON-VER as a poll).
+//
+// The facts below are from the interface description of the M9 SPG 4.04
+// firmware, UBX-21022436 R02, June 2023 (the NEO-M9N's interface description
+// is UBX-19035940, whose PDF could not be fetched; UBX-21022436 states that
+// it applies to the NEO-M9N-00B), and from the u-blox 8 / M8 receiver
+// description including protocol specification, UBX-13003221 R15.  A section
+// or message is named where a fact is used.
+//
+// A frame (UBX-21022436 Section 3.3):
+//
+//   0xB5 0x62  class  id  length (2 bytes, little-endian)  payload  CK_A CK_B
+//
+// The checksum is the 8-bit Fletcher algorithm over the class, the
+// identifier, the length and the payload (Section 3.4): CK_A = CK_A + byte and
+// CK_B = CK_B + CK_A, both starting at 0 and kept to 8 bits.  Numbers are
+// little-endian (Section 3.3.5).
+//
+// Fix kept: the reader looks for the sync bytes in whatever arrives.  A
+// receiver with NMEA output on prints text between UBX frames, which this
+// reader skips: a byte that is not 0xB5 outside a frame is dropped, and a
+// 0xB5 that is not followed by 0x62 is dropped.  The `ublox` crate's parser
+// does the same by searching its buffer for the sync pair.
+//
+// Fix kept: a frame is accepted only when its checksum matches, and a
+// payload longer than the buffer is counted and checksummed without being
+// stored, so a long message (UBX-MON-VER with many extension strings) never
+// overruns the buffer nor loses the frame boundary.
+//
+// Fix kept: UBX-NAV-PVT's fix type is not enough to trust a position.  The
+// message carries `gnssFixOK` (flags bit 0), "valid fix (i.e. within DOP and
+// accuracy masks)", and a 3D fix type with gnssFixOK clear is reported as no
+// fix (the M8 description tells users to check the flag, Section 32.18.14).
+//
+// Fix kept: the time fields are valid only when `validDate` and `validTime`
+// (valid bits 0 and 1) are set (Section 3.3.4).  The `nano` field is the
+// fraction of the second and is negative when the UTC second has been
+// rounded up; the driver then borrows one second and reports 1000 + nano /
+// 1e6 milliseconds.  A seconds field of 60 (a leap second) is reported as 59.
+//
+// Fix kept: UBX-CFG-VALSET is limited to 64 key and value pairs, and the
+// size of a value is in the key's bits 30:28 (1 for one bit, 2 for one byte,
+// 3 for two, 4 for four, 5 for eight).  The builder derives the size from the
+// key and refuses a key with another size code.
+
+use dev_bus
+use dev_gnss.{ GnssFix, FixKind }
+use dev_rtc
+use dev_rtc.{ RtcDateTime }
+
+// The first and second byte of a frame.
+pub const SYNC1 = 0xB5
+// The second byte of a frame.
+pub const SYNC2 = 0x62
+
+// The message classes used (Section 3.2).
+pub const CLASS_NAV = 0x01
+// The class of the acknowledges.
+pub const CLASS_ACK = 0x05
+// The class of the configuration messages.
+pub const CLASS_CFG = 0x06
+// The class of the monitoring messages.
+pub const CLASS_MON = 0x0A
+
+// The message identifiers used.
+pub const ID_NAV_PVT = 0x07
+// UBX-ACK-ACK: the message was acknowledged.
+pub const ID_ACK_ACK = 0x01
+// UBX-ACK-NAK: the message was refused.
+pub const ID_ACK_NAK = 0x00
+// UBX-CFG-PRT: the port configuration, for the M8.
+pub const ID_CFG_PRT = 0x00
+// UBX-CFG-MSG: the rate of a message, for the M8.
+pub const ID_CFG_MSG = 0x01
+// UBX-CFG-RATE: the navigation and measurement rate, for the M8.
+pub const ID_CFG_RATE = 0x08
+// UBX-CFG-VALSET: set configuration items, for the M9.
+pub const ID_CFG_VALSET = 0x8A
+// UBX-CFG-VALGET: get configuration items, for the M9.
+pub const ID_CFG_VALGET = 0x8B
+// UBX-MON-VER: the receiver and software version.
+pub const ID_MON_VER = 0x04
+
+// The payload of UBX-NAV-PVT in bytes (Section 3.15.11).
+pub const PVT_LEN = 92
+
+// The bytes of a payload the reader keeps: 256, enough for UBX-NAV-PVT and
+// for the three extension strings of UBX-MON-VER that name the protocol
+// version.
+pub const PAYLOAD_MAX = 256
+
+// The most a frame this driver builds takes: 6 header bytes, a payload of up
+// to 32 bytes and the checksum.
+pub const FRAME_MAX = 40
+
+// What `push` answers: a byte that completes nothing, a complete frame whose
+// checksum is right, and a complete frame whose checksum is wrong.
+pub const PUSH_NONE = 0
+// A complete frame whose checksum is right.
+pub const PUSH_FRAME = 1
+// A complete frame whose checksum is wrong.
+pub const PUSH_BAD_SUM = 2
+
+// The configuration keys used by the M9 (Section 5.9).
+// CFG-RATE-MEAS: U2, the milliseconds between measurements (minimum 25).
+pub const KEY_RATE_MEAS = 0x30210001
+// CFG-RATE-NAV: U2, the measurements per navigation solution.
+pub const KEY_RATE_NAV = 0x30210002
+// CFG-MSGOUT-UBX_NAV_PVT_UART1: U1, the output rate of UBX-NAV-PVT on UART1.
+pub const KEY_MSGOUT_PVT_UART1 = 0x20910007
+// CFG-MSGOUT-UBX_NAV_PVT_I2C: U1, the output rate of UBX-NAV-PVT on the DDC.
+pub const KEY_MSGOUT_PVT_I2C = 0x20910006
+// CFG-UART1OUTPROT-UBX: L, UBX as an output protocol of UART1.
+pub const KEY_UART1OUT_UBX = 0x10740001
+// CFG-UART1OUTPROT-NMEA: L, NMEA as an output protocol of UART1.
+pub const KEY_UART1OUT_NMEA = 0x10740002
+// CFG-UART1INPROT-UBX: L, UBX as an input protocol of UART1.
+pub const KEY_UART1IN_UBX = 0x10730001
+// CFG-UART1-BAUDRATE: U4, the baud rate of UART1.
+pub const KEY_UART1_BAUD = 0x40520001
+// CFG-I2COUTPROT-UBX: L, UBX as an output protocol of the DDC.
+pub const KEY_I2COUT_UBX = 0x10720001
+
+// The layers of UBX-CFG-VALSET (bit mask) and UBX-CFG-VALGET (number).
+pub const LAYER_RAM = 0x01
+// The battery-backed layer.
+pub const LAYER_BBR = 0x02
+// The flash layer.
+pub const LAYER_FLASH = 0x04
+
+// The reader's states, in the order the bytes of a frame arrive.
+let ST_SYNC1 = 0
+let ST_SYNC2 = 1
+let ST_CLASS = 2
+let ST_ID    = 3
+let ST_LEN0  = 4
+let ST_LEN1  = 5
+let ST_DATA  = 6
+let ST_CKA   = 7
+let ST_CKB   = 8
+
+// A reader that finds UBX frames in a stream: its state, the class, the
+// identifier and the length of the frame in progress, the bytes counted, the
+// running checksum, and the payload kept.
+pub @value
+struct UbxReader
+    state: Int
+    cls: Int
+    id: Int
+    len: Int
+    got: Int
+    ck_a: Int
+    ck_b: Int
+    payload: Vec[u8; 256]
+
+// A reader that has seen nothing.
+pub fn reader_new() -> UbxReader
+    UbxReader { state: 0, cls: 0, id: 0, len: 0, got: 0, ck_a: 0, ck_b: 0, payload: Vec.new() }
+
+// Adds `b` to the running checksum.
+fn sum(var r: UbxReader, b: Int)
+    r.ck_a = (r.ck_a + b) & 0xFF
+    r.ck_b = (r.ck_b + r.ck_a) & 0xFF
+
+// Gives the reader one byte of the stream.  Answers `PUSH_FRAME` when the byte
+// completed a frame with the right checksum: its class and identifier are in
+// `cls` and `id`, its length in `len` and the first `PAYLOAD_MAX` bytes of
+// its payload in `payload`.  `PUSH_BAD_SUM` when it completed one with the
+// wrong checksum, which is dropped; `PUSH_NONE` otherwise.  A byte that is
+// not part of a frame is dropped.
+pub fn push(var r: UbxReader, b: Int) -> Int
+    let s = r.state
+    if s == ST_SYNC1
+        if b == SYNC1
+            r.state = ST_SYNC2
+        return PUSH_NONE
+    if s == ST_SYNC2
+        if b == SYNC2
+            r.state = ST_CLASS
+        elif b != SYNC1
+            r.state = ST_SYNC1
+        return PUSH_NONE
+    if s == ST_CLASS
+        r.cls = b
+        r.ck_a = 0
+        r.ck_b = 0
+        sum(var r, b)
+        r.state = ST_ID
+        return PUSH_NONE
+    if s == ST_ID
+        r.id = b
+        sum(var r, b)
+        r.state = ST_LEN0
+        return PUSH_NONE
+    if s == ST_LEN0
+        r.len = b
+        sum(var r, b)
+        r.state = ST_LEN1
+        return PUSH_NONE
+    if s == ST_LEN1
+        r.len = r.len | (b << 8)
+        sum(var r, b)
+        r.got = 0
+        r.payload.clear()
+        r.state = ST_DATA
+        if r.len == 0
+            r.state = ST_CKA
+        return PUSH_NONE
+    if s == ST_DATA
+        sum(var r, b)
+        if r.payload.len() < PAYLOAD_MAX
+            let _ = r.payload.push(b as u8)
+        r.got = r.got + 1
+        if r.got == r.len
+            r.state = ST_CKA
+        return PUSH_NONE
+    if s == ST_CKA
+        if b != r.ck_a
+            r.state = ST_SYNC1
+            return PUSH_BAD_SUM
+        r.state = ST_CKB
+        return PUSH_NONE
+    // ST_CKB
+    r.state = ST_SYNC1
+    if b == r.ck_b
+        return PUSH_FRAME
+    PUSH_BAD_SUM
+
+// ── Frames the driver sends ──────────────────────────────────────────
+
+// Starts a frame in `out`: the sync bytes, the class, the identifier and the
+// length.  `out` is emptied first.
+fn begin(var out: Vec[u8; 40], cls: Int, id: Int, len: Int)
+    out.clear()
+    let _ = out.push(SYNC1 as u8)
+    let _ = out.push(SYNC2 as u8)
+    let _ = out.push(cls as u8)
+    let _ = out.push(id as u8)
+    let _ = out.push((len & 0xFF) as u8)
+    let _ = out.push(((len >> 8) & 0xFF) as u8)
+
+// Ends the frame in `out` with its checksum over the bytes after the sync.
+pub fn finish(var out: Vec[u8; 40])
+    var a = 0
+    var b = 0
+    for i in 2..out.len()
+        a = (a + out[i] as Int) & 0xFF
+        b = (b + a) & 0xFF
+    let _ = out.push(a as u8)
+    let _ = out.push(b as u8)
+
+// A poll request: a frame of the class and identifier with no payload, such as
+// UBX-MON-VER's (Section 3.14.15.1).
+//
+// ```novo
+// use ubx
+//
+// fn main() [io]
+//     var f: Vec[u8; 40] = Vec.new()
+//     ubx.build_poll(var f, 0x0A, 0x04)
+//     println("${f.len()} ${f[6]} ${f[7]}")   // 8 14 52
+// ```
+pub fn build_poll(var out: Vec[u8; 40], cls: Int, id: Int)
+    begin(var out, cls, id, 0)
+    finish(var out)
+
+// A UBX-CFG-MSG that sets the rate of one message on the current port, for
+// the M8 (UBX-13003221 Section 32.11.16.3): the class, the identifier and the
+// rate.
+pub fn build_cfg_msg(var out: Vec[u8; 40], msg_cls: Int, msg_id: Int, rate: Int)
+    begin(var out, CLASS_CFG, ID_CFG_MSG, 3)
+    let _ = out.push(msg_cls as u8)
+    let _ = out.push(msg_id as u8)
+    let _ = out.push(rate as u8)
+    finish(var out)
+
+// A UBX-CFG-RATE for the M8 (Section 32.11.25): the milliseconds between
+// measurements, the measurements per solution and the time reference (1 for
+// GPS time).
+pub fn build_cfg_rate(var out: Vec[u8; 40], meas_ms: Int, nav_rate: Int, time_ref: Int)
+    begin(var out, CLASS_CFG, ID_CFG_RATE, 6)
+    put2(var out, meas_ms)
+    put2(var out, nav_rate)
+    put2(var out, time_ref)
+    finish(var out)
+
+// A UBX-CFG-PRT for UART 1 of the M8 (Section 32.11.23.2): 8 data bits, no
+// parity and one stop bit (mode 0x8C0: character length 3 at bit 6, parity 4
+// at bit 9, stop bits 0 at bit 12), the baud rate, and the UBX and NMEA input
+// and output masks (bit 0 UBX, bit 1 NMEA).
+pub fn build_cfg_prt_uart1(var out: Vec[u8; 40], baud: Int, in_mask: Int, out_mask: Int)
+    begin(var out, CLASS_CFG, ID_CFG_PRT, 20)
+    let _ = out.push(1)
+    let _ = out.push(0)
+    put2(var out, 0)
+    put4(var out, 0x8C0)
+    put4(var out, baud)
+    put2(var out, in_mask)
+    put2(var out, out_mask)
+    put2(var out, 0)
+    put2(var out, 0)
+    finish(var out)
+
+// The size in bytes of the value of a key, from its size code in bits
+// 30:28: 1 for a one-bit flag and 2 for a byte (one byte), 3 two, 4 four and 5
+// eight; 0 for another code.
+pub fn key_size(key: Int) -> Int
+    let code = (key >> 28) & 7
+    if code == 1 or code == 2
+        return 1
+    if code == 3
+        return 2
+    if code == 4
+        return 4
+    if code == 5
+        return 8
+    0
+
+// A UBX-CFG-VALSET for the M9 (Section 3.10.28) with one key and its value,
+// written to the layers in `layers`.  The value is `key_size(key)` bytes,
+// little-endian.  Answers `false` and builds nothing for a key whose size
+// code is not 1 to 5 or is 8 bytes.
+pub fn build_valset(var out: Vec[u8; 40], layers: Int, key: Int, value: Int) -> Bool
+    let n = key_size(key)
+    if n == 0 or n > 4
+        return false
+    begin(var out, CLASS_CFG, ID_CFG_VALSET, 8 + n)
+    let _ = out.push(0)
+    let _ = out.push(layers as u8)
+    let _ = out.push(0)
+    let _ = out.push(0)
+    put4(var out, key)
+    for i in 0..n
+        let _ = out.push(((value >> (8 * i)) & 0xFF) as u8)
+    finish(var out)
+    true
+
+// A UBX-CFG-VALGET for the M9 (Section 3.10.27.1): one key from the layer
+// `layer` (0 RAM, 1 BBR, 2 flash, 7 default), from position 0.
+pub fn build_valget(var out: Vec[u8; 40], layer: Int, key: Int)
+    begin(var out, CLASS_CFG, ID_CFG_VALGET, 8)
+    let _ = out.push(0)
+    let _ = out.push(layer as u8)
+    put2(var out, 0)
+    put4(var out, key)
+    finish(var out)
+
+// Appends a 16-bit little-endian value.
+fn put2(var out: Vec[u8; 40], v: Int)
+    let _ = out.push((v & 0xFF) as u8)
+    let _ = out.push(((v >> 8) & 0xFF) as u8)
+
+// Appends a 32-bit little-endian value.
+fn put4(var out: Vec[u8; 40], v: Int)
+    put2(var out, v & 0xFFFF)
+    put2(var out, (v >> 16) & 0xFFFF)
+
+// ── Reading a payload ────────────────────────────────────────────────
+
+// The unsigned little-endian value of `n` bytes at `at` in the payload.
+fn u_at(var r: UbxReader, at: Int, n: Int) -> Int
+    var v = 0
+    for i in 0..n
+        v = v | (r.payload[at + i] as Int << (8 * i))
+    v
+
+// The signed little-endian value of `n` bytes at `at`.
+fn i_at(var r: UbxReader, at: Int, n: Int) -> Int
+    dev_bus.dev_sign_extend(u_at(var r, at, n), 8 * n)
+
+// Whether the frame in the reader is the message `cls` `id` of `len` bytes.
+pub fn is_message(var r: UbxReader, cls: Int, id: Int, len: Int) -> Bool
+    r.cls == cls and r.id == id and r.len == len
+
+// The fields of a UBX-NAV-PVT payload (Section 3.15.11.1) the driver reads.
+// `lon`, `lat` are 1e-7 degrees, `head_mot` and `head_acc` 1e-5 degrees,
+// `pdop` 0.01, the accuracies and the heights millimetres, the velocities
+// millimetres a second, `nano` nanoseconds, `t_acc` nanoseconds.
+pub @value
+struct UbxPvt
+    itow: Int
+    year: Int
+    month: Int
+    day: Int
+    hour: Int
+    min: Int
+    sec: Int
+    valid: Int
+    t_acc: Int
+    nano: Int
+    fix_type: Int
+    flags: Int
+    flags2: Int
+    num_sv: Int
+    lon: Int
+    lat: Int
+    height: Int
+    hmsl: Int
+    h_acc: Int
+    v_acc: Int
+    vel_n: Int
+    vel_e: Int
+    vel_d: Int
+    g_speed: Int
+    head_mot: Int
+    s_acc: Int
+    head_acc: Int
+    pdop: Int
+    flags3: Int
+
+// The fields of the UBX-NAV-PVT frame in the reader.  The caller checked
+// `is_message(r, CLASS_NAV, ID_NAV_PVT, PVT_LEN)`.
+pub fn pvt_decode(var r: UbxReader) -> UbxPvt
+    UbxPvt { itow: u_at(var r, 0, 4), year: u_at(var r, 4, 2), month: u_at(var r, 6, 1), day: u_at(var r, 7, 1),
+             hour: u_at(var r, 8, 1), min: u_at(var r, 9, 1), sec: u_at(var r, 10, 1), valid: u_at(var r, 11, 1),
+             t_acc: u_at(var r, 12, 4), nano: i_at(var r, 16, 4), fix_type: u_at(var r, 20, 1),
+             flags: u_at(var r, 21, 1), flags2: u_at(var r, 22, 1), num_sv: u_at(var r, 23, 1),
+             lon: i_at(var r, 24, 4), lat: i_at(var r, 28, 4), height: i_at(var r, 32, 4),
+             hmsl: i_at(var r, 36, 4), h_acc: u_at(var r, 40, 4), v_acc: u_at(var r, 44, 4),
+             vel_n: i_at(var r, 48, 4), vel_e: i_at(var r, 52, 4), vel_d: i_at(var r, 56, 4),
+             g_speed: i_at(var r, 60, 4), head_mot: i_at(var r, 64, 4), s_acc: u_at(var r, 68, 4),
+             head_acc: u_at(var r, 72, 4), pdop: u_at(var r, 76, 2), flags3: u_at(var r, 78, 2) }
+
+// The time one second earlier: the borrow of a negative `nano`.
+pub fn minus_second(t: RtcDateTime) -> RtcDateTime
+    if t.second > 0
+        return RtcDateTime { year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute,
+                             second: t.second - 1 }
+    if t.minute > 0
+        return RtcDateTime { year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute - 1,
+                             second: 59 }
+    if t.hour > 0
+        return RtcDateTime { year: t.year,
+            month: t.month,
+            day: t.day,
+            hour: t.hour - 1,
+            minute: 59,
+            second: 59 }
+    if t.day > 1
+        return RtcDateTime { year: t.year,
+            month: t.month,
+            day: t.day - 1,
+            hour: 23,
+            minute: 59,
+            second: 59 }
+    if t.month > 1
+        return RtcDateTime { year: t.year, month: t.month - 1,
+                             day: dev_rtc.rtc_days_in_month(t.year, t.month - 1), hour: 23, minute: 59,
+                             second: 59 }
+    RtcDateTime { year: t.year - 1, month: 12, day: 31, hour: 23, minute: 59, second: 59 }
+
+// The kind of solution for a fix type, `gnssFixOK` and `invalidLlh`:
+// 0 is none, 1 dead reckoning, 2 2D, 3 3D, 4 GNSS with dead reckoning (a 3D
+// position), 5 time only.  A fix whose `gnssFixOK` is clear, or whose
+// position is flagged invalid, is no fix, except a time-only fix, which has no
+// position to be invalid.
+pub fn fix_kind(fix_type: Int, fix_ok: Bool, invalid_llh: Bool) -> FixKind
+    if fix_type == 5
+        return FixTimeOnly
+    if not fix_ok or invalid_llh
+        return FixNone
+    if fix_type == 1
+        return FixDeadReckoning
+    if fix_type == 2
+        return Fix2d
+    if fix_type == 3 or fix_type == 4
+        return Fix3d
+    FixNone
+
+// The trait's fix for a decoded UBX-NAV-PVT.  The position is 0 unless the
+// kind carries one; the time is all zeros unless `validDate` and `validTime`
+// are both set; the altitude is the height above mean sea level; the course
+// is the heading of motion in thousandths of a degree, 0 to 359999; the
+// satellites in view are the satellites used, since the driver does not parse
+// UBX-NAV-SAT.
+pub fn pvt_to_fix(p: UbxPvt) -> GnssFix
+    let kind = fix_kind(p.fix_type, (p.flags & 1) != 0, (p.flags3 & 1) != 0)
+    var t = RtcDateTime { year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0 }
+    var millis = 0
+    if (p.valid & 3) == 3
+        var sec = p.sec
+        if sec > 59
+            sec = 59
+        t = RtcDateTime { year: p.year,
+            month: p.month,
+            day: p.day,
+            hour: p.hour,
+            minute: p.min,
+            second: sec }
+        millis = p.nano / 1000000
+        if p.nano < 0
+            t = minus_second(t)
+            millis = 1000 + p.nano / 1000000
+    var lat = 0
+    var lon = 0
+    var alt = 0
+    var speed = 0
+    var course = 0
+    if kind == Fix2d or kind == Fix3d or kind == FixDeadReckoning
+        lat = p.lat
+        lon = p.lon
+        alt = p.hmsl
+        speed = p.g_speed
+        if speed < 0
+            speed = 0
+        course = (p.head_mot / 100 % 360000 + 360000) % 360000
+    GnssFix { time: t, millis: millis, kind: kind, lat_e7: lat, lon_e7: lon, alt_mm: alt, speed_mm_s: speed,
+              course_mdeg: course, sats_used: p.num_sv, sats_in_view: p.num_sv }
+
+// ── Other messages ───────────────────────────────────────────────────
+
+// The class and identifier an UBX-ACK-ACK or UBX-ACK-NAK frame in the reader
+// acknowledges, packed as the class in bits 15:8 and the identifier in 7:0; -1
+// when the reader's frame is neither (Sections 3.9.1 and 3.9.2).
+pub fn ack_target(var r: UbxReader) -> Int
+    if r.cls != CLASS_ACK or r.len != 2 or r.id != ID_ACK_ACK and r.id != ID_ACK_NAK
+        return -1
+    (r.payload[0] as Int << 8) | r.payload[1] as Int
+
+// The characters of "PROTVER=".
+const PROTVER_TEXT = [80, 82, 79, 84, 86, 69, 82, 61]
+
+// Whether the UBX-MON-VER string of 30 bytes at `at` in the payload starts
+// with "PROTVER=".
+fn is_protver(var r: UbxReader, at: Int) -> Bool
+    for i in 0..8
+        if (r.payload[at + i] as Int) != PROTVER_TEXT[i]
+            return false
+    true
+
+// The version number in the "PROTVER=" string at `at`: the major version times
+// 100 plus the minor, so "PROTVER=32.01" is 3201.
+fn protver_number(var r: UbxReader, at: Int) -> Int
+    var major = 0
+    var minor = 0
+    var minor_part = false
+    var done = false
+    for i in at + 8..at + 30
+        if not done
+            let ch = r.payload[i] as Int
+            if ch >= 48 and ch <= 57
+                if minor_part
+                    minor = minor * 10 + ch - 48
+                else
+                    major = major * 10 + ch - 48
+            elif ch == 46 and not minor_part
+                minor_part = true
+            else
+                done = true
+    major * 100 + minor
+
+// The protocol version a UBX-MON-VER frame names in its "PROTVER=" extension
+// string (Section 3.14.15), as the major version times 100 plus the minor:
+// "PROTVER=32.01" is 3201.  -1 when the frame holds no such string.
+pub fn protver_of(var r: UbxReader) -> Int
+    if r.cls != CLASS_MON or r.id != ID_MON_VER or r.len < 40
+        return -1
+    for k in 0..8
+        let at = 40 + 30 * k
+        if at + 30 <= r.payload.len() and is_protver(var r, at)
+            return protver_number(var r, at)
+    -1

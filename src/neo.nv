@@ -1,0 +1,401 @@
+// neo — u-blox's NEO-M9N and NEO-M8N over a UART, as devices-nv's `Gnss` and
+// `Identifiable`.
+//
+// A receiver reports a fix at its navigation rate, once a second by default,
+// as a stream of bytes on its serial line: UBX-NAV-PVT frames when the UBX
+// output is on, and NMEA text (always on at power-up) when it is not.  The
+// driver reads that stream byte by byte through embedded-hal-nv's `UartRx`,
+// feeds a `UbxReader` and an `NmeaReader`, and keeps the latest fix.
+//
+// A trait method gets a plain `self`, so a driver keeps no state between calls
+// of `gnss_fix` and the others.  The stream's state therefore lives in a
+// `NeoCore`, which the functions of this module take as a `var` parameter,
+// and in one module-level `NeoCore` that the trait methods use: one receiver
+// per program, the cost the sibling drivers pay for a register shadow.  A
+// program with two receivers calls the functions with a `NeoCore` of its own
+// each.
+//
+// The UBX frame, the reader and the messages are in `ubx`, the NMEA reader in
+// `nmea`, the DDC (I2C) form in `neo_ddc` and the awaitable form in
+// `neo_async`.
+//
+// Fix kept: a command is acknowledged within a second (UBX-21022436 Section
+// 3.9.1: "at least within one second"), so every command waits for its
+// UBX-ACK-ACK or UBX-ACK-NAK for up to a second and answers whether it got
+// the ACK.  Zephyr's `gnss_u_blox_m8` waits one second after a baud rate
+// change, and so does `change_baud`.
+//
+// Fix kept: the M8 takes a measurement period of 50 ms at the least (Zephyr
+// refuses less) and the M9 25 ms (UBX-21022436 Section 5.9.18); a period
+// above 65535 ms does not fit the 16-bit field.  `rate_mhz_to_ms` rounds the
+// period up, so the rate taken is at or below the rate asked, as the trait
+// says, and answers 0 for a rate the field cannot hold.
+//
+// Fix kept: NMEA is the fallback, used until the first UBX-NAV-PVT arrives.  A
+// receiver with both outputs on would otherwise report every epoch twice, and
+// the NMEA position has fewer digits.
+//
+// Fix kept: a baud rate change is a command to the receiver and then a change
+// of the host's UART, in that order, because the receiver's acknowledge is
+// sent at the old rate.
+
+use embedded_hal.{ BoardUart, BoardTimer, UartRx, UartTx, Timer }
+use dev_gnss.{ GnssFix, Gnss, FixKind }
+use dev_rtc.{ RtcDateTime }
+use dev_id.{ DeviceId, Identifiable }
+use ubx
+use ubx.{ UbxReader, UbxPvt }
+use nmea
+use nmea.{ NmeaReader }
+
+// The model of the receiver: the NEO-M9N (protocol 32) or the NEO-M8N
+// (protocol 18).  The two differ in the configuration messages.
+pub const MODEL_M9N = 9
+// The NEO-M8N, the second part of the family.
+pub const MODEL_M8N = 8
+
+// The most bytes `pump` reads in one call, so a stream that never ends cannot
+// hold the caller.
+pub const PUMP_MAX = 512
+
+// The tries and the pause of an acknowledge wait: 100 tries of 10 ms, a
+// second.
+let ACK_TRIES    = 100
+let ACK_PAUSE_MS = 10
+
+// What a receiver needs from the board: a byte from the line or -1, a byte
+// to the line, a pause, and a change of the UART's baud rate.
+pub trait NeoPort
+    fn port_get(self) -> Int [hw]
+    fn port_put(self, b: Int) [hw]
+    fn port_pause_ms(self, ms: Int) [hw]
+    fn port_baud(self, baud: Int) [hw]
+
+// The state of a stream: the two readers, the latest fix, whether it is new,
+// the last acknowledge, the protocol version the receiver named, and counts of
+// frames dropped for a bad checksum and of UBX-NAV-PVT frames used.
+pub @value
+struct NeoCore
+    ubx: UbxReader
+    nmea: NmeaReader
+    fix: GnssFix
+    have: Bool
+    fresh: Bool
+    ack_msg: Int
+    ack_ok: Bool
+    protver: Int
+    bad_frames: Int
+    pvt_frames: Int
+
+// A fix that holds nothing: no solution, the time and position all zero.
+pub fn no_fix() -> GnssFix
+    GnssFix { time: RtcDateTime { year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0 }, millis: 0,
+              kind: FixNone, lat_e7: 0, lon_e7: 0, alt_mm: 0, speed_mm_s: 0, course_mdeg: 0, sats_used: 0,
+              sats_in_view: 0 }
+
+// A stream that has seen nothing.
+pub fn core_new() -> NeoCore
+    NeoCore { ubx: ubx.reader_new(), nmea: nmea.reader_new(), fix: no_fix(), have: false, fresh: false,
+              ack_msg: -1, ack_ok: false, protver: -1, bad_frames: 0, pvt_frames: 0 }
+
+// What a complete UBX frame does: a UBX-NAV-PVT of the right length becomes the
+// latest fix; an acknowledge is remembered; a UBX-MON-VER gives the protocol
+// version.
+fn frame_done(var c: NeoCore)
+    if ubx.is_message(var c.ubx, ubx.CLASS_NAV, ubx.ID_NAV_PVT, ubx.PVT_LEN)
+        c.fix = ubx.pvt_to_fix(ubx.pvt_decode(var c.ubx))
+        c.have = true
+        c.fresh = true
+        c.pvt_frames = c.pvt_frames + 1
+        return
+    let target = ubx.ack_target(var c.ubx)
+    if target >= 0
+        c.ack_msg = target
+        c.ack_ok = c.ubx.id == ubx.ID_ACK_ACK
+        return
+    let v = ubx.protver_of(var c.ubx)
+    if v >= 0
+        c.protver = v
+
+// Gives the stream one byte: to the UBX reader and to the NMEA reader.  A
+// complete NMEA fix is taken only while no UBX-NAV-PVT has arrived.
+pub fn feed(var c: NeoCore, b: Int)
+    let r = ubx.push(var c.ubx, b)
+    if r == ubx.PUSH_FRAME
+        frame_done(var c)
+    elif r == ubx.PUSH_BAD_SUM
+        c.bad_frames = c.bad_frames + 1
+    let _ = nmea.push(var c.nmea, b)
+    if c.nmea.fresh
+        c.nmea.fresh = false
+        if c.pvt_frames == 0
+            c.fix = nmea.fix_of(c.nmea)
+            c.have = true
+            c.fresh = true
+
+// Reads what waits on the line, at most `max` bytes, into the stream.
+// Answers the number of bytes read.
+pub fn pump<P: NeoPort>(p: P, var c: NeoCore, max: Int) -> Int [hw]
+    for i in 0..max
+        let b = p.port_get()
+        if b < 0
+            return i
+        feed(var c, b)
+    max
+
+// Sends the frame in `f` byte by byte.
+pub fn send<P: NeoPort>(p: P, var f: Vec[u8; 40]) [hw]
+    for i in 0..f.len()
+        p.port_put(f[i] as Int)
+
+// Sends the frame `f` and waits up to a second for the acknowledge of the
+// message `cls` `id`.  Whether it was an UBX-ACK-ACK; an UBX-ACK-NAK and a
+// silence are `false`.
+pub fn command<P: NeoPort>(p: P, var c: NeoCore, var f: Vec[u8; 40], cls: Int, id: Int) -> Bool [hw]
+    c.ack_msg = -1
+    send(p, var f)
+    for _k in 0..ACK_TRIES
+        let _ = pump(p, var c, 64)
+        if c.ack_msg == ((cls << 8) | id)
+            return c.ack_ok
+        p.port_pause_ms(ACK_PAUSE_MS)
+    false
+
+// The shortest measurement period the model takes, in milliseconds: 25 for
+// the M9, 50 for the M8.
+pub fn min_period_ms(model: Int) -> Int
+    if model == MODEL_M8N
+        return 50
+    25
+
+// The period in milliseconds for a rate of `mhz` millihertz, rounded up so
+// that the rate is at or below the one asked, raised to the model's minimum;
+// 0 for a rate that is not positive or a period above 65535 ms.
+pub fn rate_mhz_to_ms(mhz: Int, model: Int) -> Int
+    if mhz <= 0
+        return 0
+    var ms = (1000000 + mhz - 1) / mhz
+    if ms < min_period_ms(model)
+        ms = min_period_ms(model)
+    if ms > 65535
+        return 0
+    ms
+
+// Sets the measurement period to `ms` milliseconds and the navigation rate to
+// one solution a measurement: UBX-CFG-VALSET of CFG-RATE-MEAS for the M9,
+// UBX-CFG-RATE for the M8.  Whether the receiver acknowledged.
+pub fn set_period<P: NeoPort>(p: P, var c: NeoCore, model: Int, ms: Int) -> Bool [hw]
+    var f: Vec[u8; 40] = Vec.new()
+    if model == MODEL_M8N
+        ubx.build_cfg_rate(var f, ms, 1, 1)
+        return command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_RATE)
+    let _ = ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_RATE_MEAS, ms)
+    command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_VALSET)
+
+// Sets the rate to the nearest at or below `mhz` millihertz and answers the
+// rate taken in millihertz, 0 when the receiver refused or the rate does not
+// fit.
+pub fn set_rate_mhz<P: NeoPort>(p: P, var c: NeoCore, model: Int, mhz: Int) -> Int [hw]
+    let ms = rate_mhz_to_ms(mhz, model)
+    if ms == 0
+        return 0
+    if not set_period(p, var c, model, ms)
+        return 0
+    1000000 / ms
+
+// Switches UBX output on and asks for UBX-NAV-PVT once a navigation epoch on
+// UART 1: UBX-CFG-VALSET of CFG-UART1OUTPROT-UBX and CFG-MSGOUT-UBX_NAV_PVT_UART1
+// for the M9, UBX-CFG-PRT and UBX-CFG-MSG for the M8.  NMEA output stays as it
+// is.  Whether every command was acknowledged.
+pub fn enable_pvt<P: NeoPort>(p: P, var c: NeoCore, model: Int) -> Bool [hw]
+    var f: Vec[u8; 40] = Vec.new()
+    if model == MODEL_M8N
+        ubx.build_cfg_msg(var f, ubx.CLASS_NAV, ubx.ID_NAV_PVT, 1)
+        return command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_MSG)
+    let _ = ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_UART1OUT_UBX, 1)
+    if not command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_VALSET)
+        return false
+    let _ = ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_MSGOUT_PVT_UART1, 1)
+    command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_VALSET)
+
+// Switches NMEA output off on UART 1, so that only UBX frames arrive: for the
+// M9 UBX-CFG-VALSET of CFG-UART1OUTPROT-NMEA, for the M8 UBX-CFG-PRT with UBX
+// alone as the output protocol.  Whether the receiver acknowledged.
+pub fn nmea_off<P: NeoPort>(p: P, var c: NeoCore, model: Int, baud: Int) -> Bool [hw]
+    var f: Vec[u8; 40] = Vec.new()
+    if model == MODEL_M8N
+        ubx.build_cfg_prt_uart1(var f, baud, 3, 1)
+        return command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_PRT)
+    let _ = ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_UART1OUT_NMEA, 0)
+    command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_VALSET)
+
+// Changes the receiver's UART 1 to `baud` and then the host's: the command
+// goes at the old rate, the receiver switches after the acknowledge, and the
+// host follows after a second (the wait Zephyr makes).  Whether the receiver
+// acknowledged.  The program re-opens the line at the new rate when the
+// acknowledge is missing.
+pub fn change_baud<P: NeoPort>(p: P, var c: NeoCore, model: Int, baud: Int) -> Bool [hw]
+    var f: Vec[u8; 40] = Vec.new()
+    var ok = false
+    if model == MODEL_M8N
+        ubx.build_cfg_prt_uart1(var f, baud, 3, 3)
+        ok = command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_PRT)
+    else
+        let _ = ubx.build_valset(var f, ubx.LAYER_RAM, ubx.KEY_UART1_BAUD, baud)
+        ok = command(p, var c, var f, ubx.CLASS_CFG, ubx.ID_CFG_VALSET)
+    if ok
+        p.port_pause_ms(1000)
+        p.port_baud(baud)
+    ok
+
+// Polls UBX-MON-VER and waits up to a second for the protocol version it
+// names.  The version (major times 100 plus minor), or -1.
+pub fn identify<P: NeoPort>(p: P, var c: NeoCore) -> Int [hw]
+    var f: Vec[u8; 40] = Vec.new()
+    ubx.build_poll(var f, ubx.CLASS_MON, ubx.ID_MON_VER)
+    c.protver = -1
+    send(p, var f)
+    for _k in 0..ACK_TRIES
+        let _ = pump(p, var c, 64)
+        if c.protver >= 0
+            return c.protver
+        p.port_pause_ms(ACK_PAUSE_MS)
+    -1
+
+// Opens the line at `baud`, switches UBX-NAV-PVT output on and reads the
+// protocol version, on the stream `c`.  Whether the receiver acknowledged and
+// named a version.
+pub fn begin_with<P: NeoPort>(p: P, var c: NeoCore, model: Int, baud: Int) -> Bool [hw]
+    p.port_baud(baud)
+    if not enable_pvt(p, var c, model)
+        return false
+    identify(p, var c) >= 0
+
+// The identity a protocol version gives: the major version as `who` and the
+// minor as `rev`; `None` for no version.
+pub fn id_of_protver(v: Int) -> ?DeviceId
+    if v < 0
+        return None
+    Some(DeviceId { who: v / 100, rev: Some(v % 100) })
+
+// The latest fix of a stream, and whether a fix has been seen at all.  Marks
+// it taken.
+pub fn take_fix(var c: NeoCore) -> ?GnssFix
+    if not c.have
+        return None
+    c.fresh = false
+    Some(c.fix)
+
+// The latest fix if one has completed since the last take, and marks it
+// taken.
+pub fn take_new_fix(var c: NeoCore) -> ?GnssFix
+    if not c.fresh
+        return None
+    take_fix(var c)
+
+// ── The receiver on a board's UART ───────────────────────────────────
+
+// The line to the receiver: the board's UART and timer.
+pub @value
+struct NeoUart
+    uart: BoardUart
+    timer: BoardTimer
+
+impl NeoPort for NeoUart
+    // cov: skip — reads the board's UART, which on a host has no byte to give; the boards' images run it
+    fn port_get(self) -> Int [hw]
+        match self.uart.try_read_byte()
+            Some(b) => b
+            None    => -1
+
+    fn port_put(self, b: Int) [hw]
+        self.uart.write_byte(b)
+
+    fn port_pause_ms(self, ms: Int) [hw]
+        self.timer.delay_ms(ms)
+
+    fn port_baud(self, baud: Int) [hw]
+        self.uart.init(baud)
+
+// The stream of the program's one receiver, which the trait methods use.
+var shared: NeoCore = core_new()
+
+// Forgets everything the shared stream has seen.
+pub fn shared_reset() [mutate]
+    shared = core_new()
+
+// Gives the shared stream one byte and keeps what it completes, to be taken
+// by `gnss_fix_new`.
+pub fn shared_push(b: Int) [mutate]
+    feed(var shared, b)
+
+// Gives the shared stream one byte and answers the fix that byte completed,
+// if any, marking it taken.  The awaitable form reads the line a byte at a
+// time through this.
+pub fn shared_feed(b: Int) -> ?GnssFix [mutate]
+    feed(var shared, b)
+    take_new_fix(var shared)
+
+// A NEO-M9N or NEO-M8N on a board's UART.
+pub @value
+struct Neo
+    line: NeoUart
+    model: Int
+
+impl Neo
+    // The receiver of `model` (`MODEL_M9N` or `MODEL_M8N`) on the board's
+    // UART.  Nothing is sent.
+    fn attach(uart: BoardUart, model: Int) -> Neo
+        Neo { line: NeoUart { uart: uart, timer: BoardTimer { id: 0 } }, model: model }
+
+    // Opens the line at `baud` (9600 at power-up), switches UBX-NAV-PVT output
+    // on and reads the receiver's protocol version.  Whether the receiver
+    // acknowledged and named a version.
+    fn begin(self, baud: Int) -> Bool [hw, mutate]
+        shared_reset()
+        begin_with(self.line, var shared, self.model, baud)
+
+    // Reads what waits on the line into the shared stream; the bytes read.
+    fn poll(self) -> Int [hw, mutate]
+        pump(self.line, var shared, PUMP_MAX)
+
+    // The counts of frames dropped for a bad checksum and of NAV-PVT used.
+    fn bad_frames(self) -> Int [mutate]
+        shared.bad_frames
+
+    fn pvt_frames(self) -> Int [mutate]
+        shared.pvt_frames
+
+    // The M9 or M8 command functions on the shared stream.
+    fn set_baud(self, baud: Int) -> Bool [hw, mutate]
+        change_baud(self.line, var shared, self.model, baud)
+
+    fn set_nmea_off(self, baud: Int) -> Bool [hw, mutate]
+        nmea_off(self.line, var shared, self.model, baud)
+
+    // The protocol version the receiver named at `begin`, major times 100
+    // plus minor, or -1.
+    fn protocol_version(self) -> Int [mutate]
+        shared.protver
+
+impl Gnss[hw, mutate] for Neo
+    // The latest complete fix, after reading what waits on the line; `None`
+    // before the first.
+    fn gnss_fix(self) -> ?GnssFix [hw, mutate]
+        let _ = pump(self.line, var shared, PUMP_MAX)
+        take_fix(var shared)
+
+    // A fix completed since the last call to either method, or `None`.
+    fn gnss_fix_new(self) -> ?GnssFix [hw, mutate]
+        let _ = pump(self.line, var shared, PUMP_MAX)
+        take_new_fix(var shared)
+
+    // Sets the navigation rate (`set_rate_mhz`): the rate taken, or 0.
+    fn gnss_set_rate_mhz(self, mhz: Int) -> Int [hw, mutate]
+        set_rate_mhz(self.line, var shared, self.model, mhz)
+
+impl Identifiable[hw, mutate] for Neo
+    // The protocol version as the identity (`identify`): `who` 32 and `rev`
+    // 1 for the M9's 32.01.
+    fn device_id(self) -> ?DeviceId [hw, mutate]
+        id_of_protver(identify(self.line, var shared))

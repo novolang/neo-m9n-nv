@@ -1,0 +1,80 @@
+/* position_log.nv: a position log from a u-blox NEO-M9N on a breakout, for an
+ * nRF52840 DK or an nRF54LM20 DK
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          neo-m9n-nv and run
+ *              novo build --target=nrf52840-dk --hci-uart=physical src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The receiver's TXD goes to the board's UART receive pin and its RXD to the
+ * transmit pin, at 9600 baud, its power-on rate.  The board's UART is the
+ * console its log uses, which is RTT by default and the UART with
+ * `--hci-uart=physical`, so the receiver is read through the second and the
+ * program's own lines go out on the same wires.  The program opens the line,
+ * switches UBX-NAV-PVT output on and reads the receiver's protocol version
+ * (32.01 for the NEO-M9N, 18.00 for the NEO-M8N), then prints a line for each
+ * new fix:
+ *
+ *     gnss kind=3 lat=481373000 lon=115760000 alt=515000 sats=12
+ *
+ * The latitude and longitude are in 1e-7 degrees, the altitude in
+ * millimetres above mean sea level.  `kind` is the fix: 0 none, 1 time only,
+ * 2 2D, 3 3D, 4 dead reckoning.
+ *
+ * Effects the program declares: [hw] for the UART and the timer, and [mutate]
+ * for the driver's one stream of bytes.
+ *
+ * Boards: the nRF52840 DK drives UARTE0 and the nRF54LM20 DK UARTE30 (P0.06 to
+ * P0.09).  With no receiver on the line the program prints
+ * "neo: no answer".  The receiver has not been read on a board.
+ */
+use embedded_hal.{ BoardUart }
+use dev_gnss.{ Gnss }
+use neo
+use neo.{ Neo }
+
+// A label and a number, written without building a string.
+@tier(embedded)
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+// The number of a kind of fix, for the log.
+@tier(embedded)
+fn kind_number(k: dev_gnss.FixKind) -> Int
+    if k == dev_gnss.FixTimeOnly
+        return 1
+    if k == dev_gnss.Fix2d
+        return 2
+    if k == dev_gnss.Fix3d
+        return 3
+    if k == dev_gnss.FixDeadReckoning
+        return 4
+    0
+
+// Prints the fix if one has completed since the last look.
+@tier(embedded)
+fn report(rx: Neo) [hw, mutate]
+    match rx.gnss_fix_new()
+        Some(f) =>
+            hal.uart.write("gnss")
+            field(" kind=", kind_number(f.kind))
+            field(" lat=", f.lat_e7)
+            field(" lon=", f.lon_e7)
+            field(" alt=", f.alt_mm)
+            field(" sats=", f.sats_used)
+            hal.uart.write("\n")
+        None    => ()
+
+@tier(embedded)
+fn main() [hw, mutate]
+    let rx = Neo.attach(BoardUart { id: 0 }, neo.MODEL_M9N)
+    if not rx.begin(9600)
+        hal.uart.write("neo: no answer\n")
+        return
+    loop
+        report(rx)
+        hal.timer.delay_ms(100)

@@ -1,0 +1,39 @@
+// neo_async — the awaitable form of a fix, for a host scheduler.
+//
+// A receiver completes a fix in the background, once a second by default.
+// The awaitable form reads the UART's bytes with `UartRxAsync`, parks the task
+// while the line is quiet, feeds each byte to the program's one shared stream
+// (see `neo`) and answers the fix that byte completed.
+//
+// An `async fn` is refused at the embedded tier the package checks at
+// (E4002), and cannot take a `@value` struct (E2015), so the type is a plain
+// struct, one arena cell holding the board's `UartRxAsync`, and its method is
+// `@tier(app)`.  A device program polls: `Gnss.gnss_fix_new` reads what has
+// arrived and answers a fix only once.
+
+use embedded_hal.{ UartRxAsync }
+use dev_gnss.{ GnssFix, GnssAsync }
+use neo
+
+// A receiver whose line is read by awaiting.
+pub struct NeoAsync<R: UartRxAsync>
+    rx: R
+
+impl GnssAsync[hw, mutate, async] for NeoAsync
+    // Waits for the next complete fix and answers it.  `None` when the line
+    // answers a negative byte, which ends the stream.
+    @tier(app)
+    async fn gnss_next(self) -> ?GnssFix [hw, mutate, async]
+        var found: ?GnssFix = None
+        var open = true
+        while open
+            let b = await self.rx.read_byte()
+            if b < 0
+                open = false
+            else
+                found = neo.shared_feed(b)
+                match found
+                    Some(_f) =>
+                        open = false
+                    None     => ()
+        found

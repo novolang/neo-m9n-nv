@@ -1,0 +1,84 @@
+// neo_ddc — the NEO-M9N and NEO-M8N on their DDC port, which is I2C.
+//
+// The facts below are from the M8 receiver description, UBX-13003221 R15,
+// Section 10.5 (the DDC interface; the M9 interface description UBX-21022436
+// gives the same port in its Section 1.5).  The receiver is an I2C target at
+// 0x42 by default.  It has 256 registers of which three are implemented: the
+// number of bytes waiting in its message stream, as a 16-bit value with the
+// high byte at 0xFD and the low byte at 0xFE, and the stream itself at 0xFF.
+// A read of 0xFF returns the next byte of the stream, or 0xFF when there is
+// none, which is why the byte count is read first: 0xFF is also a byte that a
+// UBX payload may hold.  A write to the receiver, with no register address, is
+// a byte stream to its input parser; the DDC is half-duplex.
+//
+// Fix kept: the count is read before the stream and the stream is read for
+// that many bytes at most.  Reading the stream until 0xFF would end a frame at
+// any payload byte that is 0xFF, and the "0xFF means empty" rule is the
+// receiver's way of padding, not a marker.
+//
+// This form feeds a `NeoCore` and does not implement the `Gnss` trait, whose
+// transport is a UART; a program with a receiver on the DDC calls `ddc_pump`
+// and then `neo.take_fix`.  UBX-CFG-VALSET and the other commands are sent
+// with `ddc_send`, one I2C write for the whole frame, and acknowledged by
+// the same pump.  The M9 key for the UBX output on the DDC is
+// CFG-I2COUTPROT-UBX and for NAV-PVT CFG-MSGOUT-UBX_NAV_PVT_I2C.
+
+use embedded_hal.{ I2cBus }
+use dev_bus.{ DeviceWiring, DevBytes }
+use neo
+use neo.{ NeoCore }
+use ubx
+
+// The default I2C address of the receiver.
+pub const DDC_ADDR = 0x42
+
+// The registers: the high byte of the byte count, and the stream.
+let REG_COUNT  = 0xFD
+let REG_STREAM = 0xFF
+
+// The clock `ddc_ready` asks for: I2C fast mode.
+let I2C_HZ = 400000
+
+// Makes the bus ready at 400 kHz and answers whether the wiring has an
+// address.
+pub fn ddc_ready<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// The number of bytes waiting in the receiver's stream, read from 0xFD and
+// 0xFE in one transaction; -1 when the receiver did not answer.
+pub fn ddc_available<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not dev_bus.wiring_read_into(bus, w, REG_COUNT, 2, var b)
+        return -1
+    (b[0] as Int << 8) | b[1] as Int
+
+// Reads what waits in the receiver's stream, at most `max` bytes and at most
+// 32 in one call, and feeds it to the stream `c`.  Answers the number of bytes
+// read, 0 when none waited and -1 when the receiver did not answer.
+pub fn ddc_pump<B: I2cBus>(bus: B, w: DeviceWiring, var c: NeoCore, max: Int) -> Int [hw]
+    let n = ddc_available(bus, w)
+    if n <= 0
+        return n
+    var take = n
+    if take > max
+        take = max
+    if take > 32
+        take = 32
+    var b: DevBytes = Vec.new()
+    if not dev_bus.wiring_read_into(bus, w, REG_STREAM, take, var b)
+        return -1
+    for i in 0..take
+        neo.feed(var c, b[i] as Int)
+    take
+
+// Sends the frame in `f` to the receiver as one I2C write with no register
+// address.  Whether the receiver acknowledged every byte, and `false` for a
+// wiring with no address.
+pub fn ddc_send<B: I2cBus>(bus: B, w: DeviceWiring, var f: Vec[u8; 40]) -> Bool [hw]
+    let Some(addr) = w.addr else return false
+    system
+        var out: [u8] = list.with_capacity(f.len())
+        for i in 0..f.len()
+            let _ = list.try_push(out, f[i])
+        return bus.write(addr, out)
