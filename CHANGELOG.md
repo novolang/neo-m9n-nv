@@ -1,9 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-12
 
-The package takes embedded-hal-nv and devices-nv by path until 0.4.0 is
-published; each line becomes a registry range at the publish.
+The release depends on devices-nv 0.4.0 and embedded-hal-nv 0.4.0.
 
 - `gnss_accuracy` and `gnss_velocity`, the methods devices-nv 0.4.0 added to
   `Gnss`, are implemented from the latest UBX-NAV-PVT (`take_accuracy`,

@@ -1,6 +1,6 @@
 [package]
 name        = "neo-m9n-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for u-blox's NEO-M9N GNSS receiver, and the NEO-M8N as the second part of the family, over a UART or the DDC (I2C) port: the UBX frame with its checksum, a reader that walks caller-moved bytes and skips the NMEA text between frames, UBX-NAV-PVT as devices-nv's GnssFix, the acknowledgements, UBX-MON-VER as the identity, the navigation rate and the output messages by UBX-CFG-VALSET for the M9 and UBX-CFG-MSG, -RATE and -PRT for the M8, and a GGA and RMC reader with the NMEA checksum for a receiver whose UBX output is off, as devices-nv's Gnss and GnssAsync."
 license     = "Apache-2.0"
 stability   = "experimental"
