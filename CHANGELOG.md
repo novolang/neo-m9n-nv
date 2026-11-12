@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+The package takes embedded-hal-nv and devices-nv by path until 0.4.0 is
+published; each line becomes a registry range at the publish.
+
+- `gnss_accuracy` and `gnss_velocity`, the methods devices-nv 0.4.0 added to
+  `Gnss`, are implemented from the latest UBX-NAV-PVT (`take_accuracy`,
+  `take_velocity`): hAcc, vAcc, pDOP and velN, velE, velD.  `hdop_x100` is the
+  HDOP of the latest GGA times 100, which `nmea` now reads (`NmeaReader.hdop`),
+  and 0 when no GGA has been read.  Both answer `None` before the first
+  UBX-NAV-PVT and when the latest one held no position.
+- **Breaking:** the module-level stream is gone.  `Neo` is now a plain struct
+  that holds a `NeoStream`, one arena cell made by `attach`, so two receivers
+  can exist in one program and the `Gnss` implementation holds no module
+  state.  `neo.shared_reset`, `shared_push` and `shared_feed` are replaced by
+  `stream_reset`, `stream_push` and `stream_feed`, which take the stream
+  (`Neo.stream`).  `NeoAsync` gains a `stream` field: `NeoAsync { rx: r,
+  stream: neo.stream_new() }`, or the `stream` of a `Neo` on the same line.
+  `Neo` is no longer a `@value`.  The `.data` and `.bss` of a device image fall
+  by about 760 bytes, which are now arena bytes.
+- `NeoCore` gains the fields that hold the latest UBX-NAV-PVT's accuracy and
+  velocity.
+
 ## 0.1.0
 
 The first release: a driver for u-blox's NEO-M9N GNSS receiver, and the NEO-M8N

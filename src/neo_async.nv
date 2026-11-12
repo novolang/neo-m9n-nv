@@ -2,8 +2,10 @@
 //
 // A receiver completes a fix in the background, once a second by default.
 // The awaitable form reads the UART's bytes with `UartRxAsync`, parks the task
-// while the line is quiet, feeds each byte to the program's one shared stream
-// (see `neo`) and answers the fix that byte completed.
+// while the line is quiet, feeds each byte to its stream (see `neo`) and
+// answers the fix that byte completed.  The stream is the `NeoStream` of a
+// `Neo` on the same line when a program reads the fix both ways, or one of its
+// own.
 //
 // An `async fn` is refused at the embedded tier the package checks at
 // (E4002), and cannot take a `@value` struct (E2015), so the type is a plain
@@ -14,10 +16,12 @@
 use embedded_hal.{ UartRxAsync }
 use dev_gnss.{ GnssFix, GnssAsync }
 use neo
+use neo.{ NeoStream }
 
 // A receiver whose line is read by awaiting.
 pub struct NeoAsync<R: UartRxAsync>
     rx: R
+    stream: NeoStream
 
 impl GnssAsync[hw, mutate, async] for NeoAsync
     // Waits for the next complete fix and answers it.  `None` when the line
@@ -31,7 +35,7 @@ impl GnssAsync[hw, mutate, async] for NeoAsync
             if b < 0
                 open = false
             else
-                found = neo.shared_feed(b)
+                found = neo.stream_feed(self.stream, b)
                 match found
                     Some(_f) =>
                         open = false

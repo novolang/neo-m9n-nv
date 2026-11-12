@@ -10,8 +10,8 @@
 //
 // where `hh` is the exclusive-or of every character between `$` and `*`, in
 // two hexadecimal digits.  GGA (fix data) gives the time, the position, the
-// fix quality, the number of satellites used and the altitude above mean sea
-// level; RMC (recommended minimum data) gives the time, the status, the
+// fix quality, the number of satellites used, the horizontal dilution of
+// precision and the altitude above mean sea level; RMC (recommended minimum data) gives the time, the status, the
 // position, the speed over ground in knots, the course over ground and the
 // date.
 //
@@ -68,6 +68,7 @@ struct NmeaReader
     alt_known: Bool
     quality: Int
     sats: Int
+    hdop: Int
     status_ok: Bool
     speed: Int
     course: Int
@@ -79,7 +80,7 @@ struct NmeaReader
 // A reader that has read nothing.
 pub fn reader_new() -> NmeaReader
     NmeaReader { active: false, line: Vec.new(), gga_key: -1, rmc_key: -2, hour: 0, minute: 0, second: 0, millis: 0,
-                 lat: 0, lon: 0, alt: 0, alt_known: false, quality: 0, sats: 0, status_ok: false, speed: 0,
+                 lat: 0, lon: 0, alt: 0, alt_known: false, quality: 0, sats: 0, hdop: 0, status_ok: false, speed: 0,
                  course: 0, day: 0, month: 0, year: 0, fresh: false }
 
 // The value of a hexadecimal digit, or -1.
@@ -195,6 +196,11 @@ fn read_gga(var rd: NmeaReader)
     let s = field_number(var rd, 7, 0)
     if s > 0
         rd.sats = s
+    // The horizontal dilution of precision times 100; 0 for an empty field.
+    rd.hdop = 0
+    let h = field_number(var rd, 8, 2)
+    if h > 0
+        rd.hdop = h
     let a = field_number(var rd, 9, 3)
     rd.alt_known = a >= 0
     rd.alt = 0

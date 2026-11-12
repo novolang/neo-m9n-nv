@@ -8,12 +8,12 @@
 // feeds a `UbxReader` and an `NmeaReader`, and keeps the latest fix.
 //
 // A trait method gets a plain `self`, so a driver keeps no state between calls
-// of `gnss_fix` and the others.  The stream's state therefore lives in a
-// `NeoCore`, which the functions of this module take as a `var` parameter,
-// and in one module-level `NeoCore` that the trait methods use: one receiver
-// per program, the cost the sibling drivers pay for a register shadow.  A
-// program with two receivers calls the functions with a `NeoCore` of its own
-// each.
+// of `gnss_fix` and the others unless the state is in a reference.  The
+// stream's state lives in a `NeoCore`, which the functions of this module take
+// as a `var` parameter, and `Neo` holds it in a `NeoStream`, a plain struct
+// with a `var` field: one arena cell made at `attach`, shared by every copy of
+// the `Neo`, and written through a plain `self`.  A program may have as many
+// receivers as it has UARTs, and the module holds no state of its own.
 //
 // The UBX frame, the reader and the messages are in `ubx`, the NMEA reader in
 // `nmea`, the DDC (I2C) form in `neo_ddc` and the awaitable form in
@@ -40,7 +40,7 @@
 // sent at the old rate.
 
 use embedded_hal.{ BoardUart, BoardTimer, UartRx, UartTx, Timer }
-use dev_gnss.{ GnssFix, Gnss, FixKind }
+use dev_gnss.{ GnssFix, Gnss, FixKind, GnssAccuracy, GnssVelocity }
 use dev_rtc.{ RtcDateTime }
 use dev_id.{ DeviceId, Identifiable }
 use ubx
@@ -73,7 +73,10 @@ pub trait NeoPort
 
 // The state of a stream: the two readers, the latest fix, whether it is new,
 // the last acknowledge, the protocol version the receiver named, and counts of
-// frames dropped for a bad checksum and of UBX-NAV-PVT frames used.
+// frames dropped for a bad checksum and of UBX-NAV-PVT frames used.  `acc_ok`
+// is true when the latest UBX-NAV-PVT held a position, and `h_acc`, `v_acc`,
+// `pdop` and the three velocities are that message's: the accuracies in
+// millimetres, the dilution times 100, the velocities in millimetres a second.
 pub @value
 struct NeoCore
     ubx: UbxReader
@@ -86,6 +89,13 @@ struct NeoCore
     protver: Int
     bad_frames: Int
     pvt_frames: Int
+    acc_ok: Bool
+    h_acc: Int
+    v_acc: Int
+    pdop: Int
+    vel_n: Int
+    vel_e: Int
+    vel_d: Int
 
 // A fix that holds nothing: no solution, the time and position all zero.
 pub fn no_fix() -> GnssFix
@@ -96,14 +106,23 @@ pub fn no_fix() -> GnssFix
 // A stream that has seen nothing.
 pub fn core_new() -> NeoCore
     NeoCore { ubx: ubx.reader_new(), nmea: nmea.reader_new(), fix: no_fix(), have: false, fresh: false,
-              ack_msg: -1, ack_ok: false, protver: -1, bad_frames: 0, pvt_frames: 0 }
+              ack_msg: -1, ack_ok: false, protver: -1, bad_frames: 0, pvt_frames: 0,
+              acc_ok: false, h_acc: 0, v_acc: 0, pdop: 0, vel_n: 0, vel_e: 0, vel_d: 0 }
 
 // What a complete UBX frame does: a UBX-NAV-PVT of the right length becomes the
 // latest fix; an acknowledge is remembered; a UBX-MON-VER gives the protocol
 // version.
 fn frame_done(var c: NeoCore)
     if ubx.is_message(var c.ubx, ubx.CLASS_NAV, ubx.ID_NAV_PVT, ubx.PVT_LEN)
-        c.fix = ubx.pvt_to_fix(ubx.pvt_decode(var c.ubx))
+        let p = ubx.pvt_decode(var c.ubx)
+        c.fix = ubx.pvt_to_fix(p)
+        c.acc_ok = c.fix.kind != FixNone
+        c.h_acc = p.h_acc
+        c.v_acc = p.v_acc
+        c.pdop = p.pdop
+        c.vel_n = p.vel_n
+        c.vel_e = p.vel_e
+        c.vel_d = p.vel_d
         c.have = true
         c.fresh = true
         c.pvt_frames = c.pvt_frames + 1
@@ -293,6 +312,25 @@ pub fn take_new_fix(var c: NeoCore) -> ?GnssFix
         return None
     take_fix(var c)
 
+// The accuracy of the latest UBX-NAV-PVT: its horizontal and vertical
+// accuracy estimates and its position dilution of precision, and the
+// horizontal dilution of precision of the latest GGA, which UBX-NAV-PVT does
+// not carry.  `hdop_x100` is 0 when no GGA has been read, as when NMEA output
+// is off, since a real dilution is never below 100.  `None` before a
+// UBX-NAV-PVT, and when the latest one held no position.
+pub fn take_accuracy(c: NeoCore) -> ?GnssAccuracy
+    if not c.acc_ok
+        return None
+    Some(GnssAccuracy { h_acc_mm: c.h_acc, v_acc_mm: c.v_acc, pdop_x100: c.pdop, hdop_x100: c.nmea.hdop })
+
+// The velocity vector of the latest UBX-NAV-PVT, in the north, east, down
+// frame.  `None` before a UBX-NAV-PVT, and when the latest one held no
+// position.  An NMEA fix has the speed and the course only.
+pub fn take_velocity(c: NeoCore) -> ?GnssVelocity
+    if not c.acc_ok
+        return None
+    Some(GnssVelocity { north_mm_s: c.vel_n, east_mm_s: c.vel_e, down_mm_s: c.vel_d })
+
 // ── The receiver on a board's UART ───────────────────────────────────
 
 // The line to the receiver: the board's UART and timer.
@@ -317,85 +355,125 @@ impl NeoPort for NeoUart
     fn port_baud(self, baud: Int) [hw]
         self.uart.init(baud)
 
-// The stream of the program's one receiver, which the trait methods use.
-var shared: NeoCore = core_new()
+// The stream of one receiver, held in a reference so that a trait method with
+// a plain `self` can change it.  The field is `var`, which is what lets the
+// store through `self`; it is one arena cell, made by `stream_new`.
+pub struct NeoStream
+    var core: NeoCore
 
-// Forgets everything the shared stream has seen.
-pub fn shared_reset() [mutate]
-    shared = core_new()
+// A stream that has seen nothing.  The one arena cell is made in a `system`
+// block, as the embedded tier does not construct a boxed struct otherwise.
+pub fn stream_new() -> NeoStream
+    let c = core_new()
+    system
+        return NeoStream { core: c }
 
-// Gives the shared stream one byte and keeps what it completes, to be taken
-// by `gnss_fix_new`.
-pub fn shared_push(b: Int) [mutate]
-    feed(var shared, b)
+// Forgets everything the stream has seen.
+pub fn stream_reset(s: NeoStream) [mutate]
+    var t = s
+    t.core = core_new()
 
-// Gives the shared stream one byte and answers the fix that byte completed,
-// if any, marking it taken.  The awaitable form reads the line a byte at a
-// time through this.
-pub fn shared_feed(b: Int) -> ?GnssFix [mutate]
-    feed(var shared, b)
-    take_new_fix(var shared)
+// Gives the stream one byte and keeps what it completes, to be taken by
+// `gnss_fix_new`.
+pub fn stream_push(s: NeoStream, b: Int) [mutate]
+    var t = s
+    feed(var t.core, b)
 
-// A NEO-M9N or NEO-M8N on a board's UART.
-pub @value
-struct Neo
+// Gives the stream one byte and answers the fix that byte completed, if any,
+// marking it taken.  The awaitable form reads the line a byte at a time
+// through this.
+pub fn stream_feed(s: NeoStream, b: Int) -> ?GnssFix [mutate]
+    var t = s
+    feed(var t.core, b)
+    take_new_fix(var t.core)
+
+// A NEO-M9N or NEO-M8N on a board's UART.  A plain struct, since it holds
+// the stream, which is a reference: the arena cell `attach` makes is shared
+// by every copy.
+pub struct Neo
     line: NeoUart
     model: Int
+    stream: NeoStream
 
 impl Neo
     // The receiver of `model` (`MODEL_M9N` or `MODEL_M8N`) on the board's
-    // UART.  Nothing is sent.
+    // UART, with a stream of its own.  Nothing is sent.
     fn attach(uart: BoardUart, model: Int) -> Neo
-        Neo { line: NeoUart { uart: uart, timer: BoardTimer { id: 0 } }, model: model }
+        let line = NeoUart { uart: uart, timer: BoardTimer { id: 0 } }
+        let s = stream_new()
+        system
+            return Neo { line: line, model: model, stream: s }
 
     // Opens the line at `baud` (9600 at power-up), switches UBX-NAV-PVT output
     // on and reads the receiver's protocol version.  Whether the receiver
     // acknowledged and named a version.
     fn begin(self, baud: Int) -> Bool [hw, mutate]
-        shared_reset()
-        begin_with(self.line, var shared, self.model, baud)
+        var s = self.stream
+        s.core = core_new()
+        begin_with(self.line, var s.core, self.model, baud)
 
-    // Reads what waits on the line into the shared stream; the bytes read.
+    // Reads what waits on the line into the stream; the bytes read.
     fn poll(self) -> Int [hw, mutate]
-        pump(self.line, var shared, PUMP_MAX)
+        var s = self.stream
+        pump(self.line, var s.core, PUMP_MAX)
 
     // The counts of frames dropped for a bad checksum and of NAV-PVT used.
-    fn bad_frames(self) -> Int [mutate]
-        shared.bad_frames
+    fn bad_frames(self) -> Int
+        self.stream.core.bad_frames
 
-    fn pvt_frames(self) -> Int [mutate]
-        shared.pvt_frames
+    fn pvt_frames(self) -> Int
+        self.stream.core.pvt_frames
 
-    // The M9 or M8 command functions on the shared stream.
+    // The M9 or M8 command functions on the stream.
     fn set_baud(self, baud: Int) -> Bool [hw, mutate]
-        change_baud(self.line, var shared, self.model, baud)
+        var s = self.stream
+        change_baud(self.line, var s.core, self.model, baud)
 
     fn set_nmea_off(self, baud: Int) -> Bool [hw, mutate]
-        nmea_off(self.line, var shared, self.model, baud)
+        var s = self.stream
+        nmea_off(self.line, var s.core, self.model, baud)
 
     // The protocol version the receiver named at `begin`, major times 100
     // plus minor, or -1.
-    fn protocol_version(self) -> Int [mutate]
-        shared.protver
+    fn protocol_version(self) -> Int
+        self.stream.core.protver
 
 impl Gnss[hw, mutate] for Neo
     // The latest complete fix, after reading what waits on the line; `None`
     // before the first.
     fn gnss_fix(self) -> ?GnssFix [hw, mutate]
-        let _ = pump(self.line, var shared, PUMP_MAX)
-        take_fix(var shared)
+        var s = self.stream
+        let _ = pump(self.line, var s.core, PUMP_MAX)
+        take_fix(var s.core)
 
     // A fix completed since the last call to either method, or `None`.
     fn gnss_fix_new(self) -> ?GnssFix [hw, mutate]
-        let _ = pump(self.line, var shared, PUMP_MAX)
-        take_new_fix(var shared)
+        var s = self.stream
+        let _ = pump(self.line, var s.core, PUMP_MAX)
+        take_new_fix(var s.core)
 
     // Sets the navigation rate (`set_rate_mhz`): the rate taken, or 0.
     fn gnss_set_rate_mhz(self, mhz: Int) -> Int [hw, mutate]
-        set_rate_mhz(self.line, var shared, self.model, mhz)
+        var s = self.stream
+        set_rate_mhz(self.line, var s.core, self.model, mhz)
+
+    // The accuracy of the latest UBX-NAV-PVT (`take_accuracy`), after reading
+    // what waits on the line.
+    fn gnss_accuracy(self) -> ?GnssAccuracy [hw, mutate]
+        var s = self.stream
+        let _ = pump(self.line, var s.core, PUMP_MAX)
+        take_accuracy(s.core)
+
+    // The velocity vector of the latest UBX-NAV-PVT (`take_velocity`), after
+    // reading what waits on the line.
+    fn gnss_velocity(self) -> ?GnssVelocity [hw, mutate]
+        var s = self.stream
+        let _ = pump(self.line, var s.core, PUMP_MAX)
+        take_velocity(s.core)
 
 impl Identifiable[hw, mutate] for Neo
     // The protocol version as the identity (`identify`): `who` 32 and `rev`
     // 1 for the M9's 32.01.
     fn device_id(self) -> ?DeviceId [hw, mutate]
-        id_of_protver(identify(self.line, var shared))
+        var s = self.stream
+        id_of_protver(identify(self.line, var s.core))

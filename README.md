@@ -90,23 +90,24 @@ bash tests/device_build.sh
 
 | Image | Flash | Of which the program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk`, RTT | 17,548 B | 9,354 B | 3,428 B |
-| `nrf54lm20-dk`, RTT | 18,436 B | 9,418 B | 3,412 B |
-| `nrf52840-dk`, `--hci-uart=physical` | 18,764 B | 10,400 B | 3,504 B |
-| `nrf54lm20-dk`, `--hci-uart=physical` | 19,924 B | 10,720 B | 3,488 B |
+| `nrf52840-dk`, RTT | 18,628 B | 10,208 B | 2,668 B |
+| `nrf54lm20-dk`, RTT | 19,516 B | 10,266 B | 2,644 B |
+| `nrf52840-dk`, `--hci-uart=physical` | 19,812 B | 11,306 B | 2,736 B |
+| `nrf54lm20-dk`, `--hci-uart=physical` | 20,972 B | 11,622 B | 2,712 B |
 
 The numbers are from the build's memory report.  Flash also holds the runtime,
 the compiler's support library and the program's tables.  The arena, 65,536 B on
 the Nordic boards, is the runtime's heap and is reserved whether or not the
-program uses it.  760 bytes of the RAM are the driver's one stream of bytes (the
-two readers and the latest fix).  The RTT rows are the image with the receiver's
+program uses it.  The receiver's stream of bytes (the two readers and the latest
+fix, about 760 bytes) is one cell of that arena, made when the program calls
+`attach`, and is not in the `.data` and `.bss` column.  The RTT rows are the image with the receiver's
 line absent; the UART rows have the line.  A reply from a receiver over a DK's
 UART is NOT VERIFIED until the driver rig carries one.
 
 ### The effects
 
 Every function of the driver that reaches the UART or the timer declares `[hw]`,
-and the functions and trait methods that touch the shared stream declare
+and the functions and trait methods that write the stream declare
 `[mutate]`.  The frame builders, the checksum, the readers and the conversion of
 a UBX-NAV-PVT to a fix are pure.  The driver performs no input or output of its
 own and builds no list of its own: every frame is a `Vec[u8; 40]` and the
@@ -146,7 +147,19 @@ acknowledge of a UBX-CFG-MSG, `B5 62 05 01 02 00 06 01 0F 38`.
 
 The frame decodes to a `UbxPvt` with all of the fields, which also holds the
 accuracies (`hAcc`, `vAcc`, `sAcc`, `headAcc`), the velocities (`velN`, `velE`,
-`velD`), the time accuracy and `pDOP`.
+`velD`), the time accuracy and `pDOP`.  Three of them reach the traits:
+
+| UBX-NAV-PVT field | Offset | Where it goes |
+|---|---|---|
+| hAcc, vAcc | 40, 44 | `gnss_accuracy().h_acc_mm`, `v_acc_mm`, in millimetres |
+| pDOP | 76 | `gnss_accuracy().pdop_x100`, the dilution times 100 |
+| velN, velE, velD | 48, 52, 56 | `gnss_velocity()`: `north_mm_s`, `east_mm_s`, `down_mm_s` |
+
+UBX-NAV-PVT has no horizontal dilution, so `hdop_x100` is the HDOP of the latest
+GGA times 100, and 0 when no GGA has been read, as when NMEA output is off.
+`gnss_accuracy` and `gnss_velocity` answer `None` before the first UBX-NAV-PVT
+and when the latest one held no position; an NMEA fix has the speed and the
+course only.
 
 The M9's configuration keys the driver uses are in `ubx`: `KEY_RATE_MEAS`
 (0x30210001, the milliseconds between measurements, at least 25),
@@ -185,13 +198,16 @@ model.  The type implements `Gnss` and `Identifiable`.
 | `set_baud(baud)`, `set_nmea_off(baud)` | the receiver's UART 1 rate, and UBX alone as its output |
 | `poll()`, `protocol_version()`, `bad_frames()`, `pvt_frames()` | read the line into the stream; the version `begin` named; counts |
 
-A trait method gets a plain `self`, so a driver keeps no state between calls.
-The stream's state, the two readers and the latest fix, is therefore one
-module-level `NeoCore` that the methods use: one receiver per program.  A
-program with two receivers, or a test, calls the functions of `neo` with a
-`NeoCore` of its own: `neo.pump(port, var core, max)`, `neo.feed(var core, byte)`,
+A trait method gets a plain `self`.  The stream's state, the two readers and the
+latest fix, therefore lives in a `NeoStream`: a plain struct with a `var`
+field holding the `NeoCore`, made by `attach` and shared by every copy of the
+`Neo`, so the methods change it through `self`.  Each `Neo` has a stream of its
+own, so a program may have a receiver on every UART it has.  A test, or a program
+that holds its own line, calls the functions of `neo` with a `NeoCore` of its own:
+`neo.pump(port, var core, max)`, `neo.feed(var core, byte)`,
 `neo.take_new_fix(var core)`, `neo.enable_pvt(port, var core, model)`.  They take
-a `NeoPort` over the line.
+a `NeoPort` over the line.  `neo.stream_new()`, `stream_push(stream, byte)` and
+`stream_feed(stream, byte)` give a stream the bytes without a line.
 
 ### The DDC form
 
@@ -221,7 +237,8 @@ struct and its method is `@tier(app)`; a device program polls `gnss_fix_new`.
 2. Every command waits up to a second for its UBX-ACK-ACK or UBX-ACK-NAK, which
    the sheet says comes "at least within one second".  A NAK, an acknowledge of
    another message and silence are all `false`.
-3. `gnss_fix_new` is for a loop that sees each fix once; `gnss_fix` answers the
+3. `gnss_accuracy` and `gnss_velocity` read the line as `gnss_fix` does and answer
+   the latest UBX-NAV-PVT's figures; they do not take the fix.  `gnss_fix_new` is for a loop that sees each fix once; `gnss_fix` answers the
    latest and marks it taken.  Both read at most 512 bytes from the line.  At
    9600 baud a UBX-NAV-PVT frame is 100 bytes and takes 100 ms, so read at least
    every 100 ms; the line's own buffer is the board's.
@@ -247,10 +264,21 @@ struct and its method is `@tier(app)`; a device program polls `gnss_fix_new`.
     are skipped, and a payload longer than the 256 bytes the reader keeps is
     checksummed without being stored.
 
+## Where the traits fall short
+
+- `GnssFix.sats_in_view` is the satellites used, since UBX-NAV-SAT is not
+  parsed; the trait holds the field and the driver has nothing to fill it with.
+- `Gnss` and `GnssAsync` have no DDC form: the transport of the trait is a UART.
+- An `async fn` cannot take a `@value` struct (E2015) and is refused at the
+  embedded tier, so `NeoAsync` is a plain struct whose method is `@tier(app)`
+  (the `*Async` traits row of section 3.5 of
+  `planning/PERIPHERAL-DRIVER-CANDIDATES.md`).
+
 ## What is not included
 
 - UBX-NAV-SAT (the satellites in view), UBX-NAV-DOP and the other navigation
-  messages: only UBX-NAV-PVT, the acknowledges and UBX-MON-VER are parsed.
+  messages: only UBX-NAV-PVT, the acknowledges and UBX-MON-VER are parsed.  The
+  horizontal dilution of precision comes from GGA until UBX-NAV-DOP is read.
   NOT IMPLEMENTED.
 - The AssistNow data (UBX-MGA) and the almanac and ephemeris messages.
   NOT IMPLEMENTED.

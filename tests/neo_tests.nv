@@ -974,40 +974,106 @@ fn test_the_identity_is_the_protocol_version() [io, hw, mutate]
         None    => test.assert(false)
     test.assert(neo.id_of_protver(-1) == None)
 
-// ── The type on the shared stream ────────────────────────────────────
+// ── The type on its own stream ───────────────────────────────────────
 
 fn receiver() -> Neo
     Neo.attach(BoardUart { id: 0 }, neo.MODEL_M9N)
 
 @test
-fn test_the_trait_methods_read_the_shared_stream() [io, hw, mutate]
-    neo.shared_reset()
+fn test_the_trait_methods_read_the_receivers_stream() [io, hw, mutate]
     let r = receiver()
+    neo.stream_reset(r.stream)
     // Before any byte: no record.
     test.assert(is_none(r.gnss_fix()))
     test.assert(is_none(r.gnss_fix_new()))
-    // The shared stream completes a fix; the line has nothing more.
+    // The stream completes a fix; the line has nothing more.
     var seen: Int = 0
     for b in pvt_frame()
-        match neo.shared_feed(b)
+        match neo.stream_feed(r.stream, b)
             Some(_f) =>
                 seen = seen + 1
             None     => ()
     test.assert_eq(seen, 1)
     test.assert_eq(r.pvt_frames(), 1)
     test.assert_eq(r.bad_frames(), 0)
-    // The fix was taken by shared_feed; gnss_fix still answers the latest.
+    // The fix was taken by stream_feed; gnss_fix still answers the latest.
     test.assert_eq(fix_or(r.gnss_fix()).lat_e7, 481373000)
     test.assert(is_none(r.gnss_fix_new()))
     // Another frame is new once.
     for b in pvt_frame()
-        neo.shared_push(b)
+        neo.stream_push(r.stream, b)
     test.assert_eq(fix_or(r.gnss_fix_new()).sats_used, 12)
     test.assert(is_none(r.gnss_fix_new()))
 
+// Feeds every byte of `xs` to the receiver's stream.
+fn feed_receiver(r: Neo, xs: [Int])
+    for b in xs
+        neo.stream_push(r.stream, b)
+
+@test
+fn test_the_accuracy_and_the_velocity_come_from_the_latest_nav_pvt() [io, hw, mutate]
+    let r = receiver()
+    // Before any message: nothing.
+    test.assert(r.gnss_accuracy() == None)
+    test.assert(r.gnss_velocity() == None)
+    // The recorded message: hAcc 1500 mm, vAcc 2300 mm, pDOP 1.50, and
+    // velN 1000, velE -500 and velD 0 mm/s.  The horizontal dilution is in
+    // UBX-NAV-DOP and GGA, not here: 0 until a GGA is read.
+    feed_receiver(r, pvt_frame())
+    match r.gnss_accuracy()
+        Some(a) =>
+            test.assert_eq(a.h_acc_mm, 1500)
+            test.assert_eq(a.v_acc_mm, 2300)
+            test.assert_eq(a.pdop_x100, 150)
+            test.assert_eq(a.hdop_x100, 0)
+        None    => test.assert(false)
+    match r.gnss_velocity()
+        Some(v) =>
+            test.assert_eq(v.north_mm_s, 1000)
+            test.assert_eq(v.east_mm_s, -500)
+            test.assert_eq(v.down_mm_s, 0)
+        None    => test.assert(false)
+    // The GGA's HDOP of 0.9.
+    feed_receiver(r, gga())
+    match r.gnss_accuracy()
+        Some(a) => test.assert_eq(a.hdop_x100, 90)
+        None    => test.assert(false)
+    // Reading them does not take the fix.
+    test.assert_eq(fix_or(r.gnss_fix_new()).sats_used, 12)
+
+@test
+fn test_a_nav_pvt_with_no_position_has_no_accuracy_or_velocity() [io, hw, mutate]
+    let r = receiver()
+    var xs = pvt_payload()
+    // fixType 0, flags 0: no solution.
+    xs[20] = 0
+    xs[21] = 0
+    feed_receiver(r, frame_of(1, 7, xs))
+    test.assert_eq(r.pvt_frames(), 1)
+    test.assert(r.gnss_accuracy() == None)
+    test.assert(r.gnss_velocity() == None)
+    // A position again.
+    feed_receiver(r, pvt_frame())
+    test.assert(r.gnss_accuracy() != None)
+    test.assert(r.gnss_velocity() != None)
+
+@test
+fn test_two_receivers_keep_two_streams() [io, hw, mutate]
+    let a = receiver()
+    let b = receiver()
+    feed_receiver(a, pvt_frame())
+    test.assert_eq(a.pvt_frames(), 1)
+    test.assert_eq(b.pvt_frames(), 0)
+    test.assert(b.gnss_accuracy() == None)
+    test.assert(a.gnss_accuracy() != None)
+    // A copy of the handle names the same stream.
+    let c = a
+    test.assert_eq(c.pvt_frames(), 1)
+    neo.stream_reset(a.stream)
+    test.assert_eq(c.pvt_frames(), 0)
+
 @test
 fn test_the_type_over_a_line_with_no_receiver() [io, hw, mutate]
-    neo.shared_reset()
     let r = receiver()
     test.assert_eq(r.poll(), 0)
     test.assert(not r.begin(9600))
@@ -1166,11 +1232,10 @@ fn rx_of(xs: [Int]) -> FakeRx
 
 @tier(app)
 fn rx_async(r: FakeRx) -> NeoAsync<FakeRx>
-    NeoAsync { rx: r }
+    NeoAsync { rx: r, stream: neo.stream_new() }
 
 @test
 fn test_an_awaited_fix_is_the_one_the_next_frame_completes() [io, hw, mutate, async]
-    neo.shared_reset()
     var stream: [Int] = gga()
     for b in pvt_frame()
         list.push(stream, b)
@@ -1183,6 +1248,20 @@ fn test_an_awaited_fix_is_the_one_the_next_frame_completes() [io, hw, mutate, as
 
 @test
 fn test_an_awaited_fix_ends_with_the_line() [io, hw, mutate, async]
-    neo.shared_reset()
     let n = rx_async(rx_of(gga()))
     test.assert(await n.gnss_next() == None)
+
+@test
+fn test_the_gga_horizontal_dilution_is_read_times_100() [io, hw]
+    var rd = nmea.reader_new()
+    test.assert_eq(rd.hdop, 0)
+    let _ = nmea_all(var rd, gga())
+    test.assert_eq(rd.hdop, 90)
+    // Two decimals and a field of several digits.
+    let _ = nmea_all(var rd, sentence("GNGGA,123456.00,4807.038,N,01131.000,E,1,12,12.34,545.4,M,46.9,M,,"))
+    test.assert_eq(rd.hdop, 1234)
+    // The 99.99 of a receiver with no solution, and an empty field.
+    let _ = nmea_all(var rd, sentence("GNGGA,123456.00,,,,,0,00,99.99,,,,,,"))
+    test.assert_eq(rd.hdop, 9999)
+    let _ = nmea_all(var rd, sentence("GNGGA,123456.00,4807.038,N,01131.000,E,1,12,,545.4,M,46.9,M,,"))
+    test.assert_eq(rd.hdop, 0)
