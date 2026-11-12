@@ -30,7 +30,7 @@ tier = "embedded"
 # traits they implement.
 # A path dependency until 0.4.0 is published: PATH-DEPENDENCIES.md in the
 # parent directory lists the line that becomes "^0.4.0".
-embedded-hal-nv = { path = "../embedded-hal-nv" }
+embedded-hal-nv = "^0.4.0"
 # The Gnss trait and the fix it answers, the real-time clock's date and time,
 # the wiring record and the register helpers.
-devices-nv      = { path = "../devices-nv" }
+devices-nv      = "^0.4.0"
